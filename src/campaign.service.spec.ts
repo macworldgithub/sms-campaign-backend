@@ -23,9 +23,64 @@ describe('Campaign controls', () => {
     consent: 'express',
     evidence: 'Customer opt-in record 123',
   };
+  it('stores only the configured sender replies, deduplicates and suppresses STOP', () => {
+    const original = process.env.MOBILEMESSAGE_FROM;
+    process.env.MOBILEMESSAGE_FROM = '+61468104118';
+    try {
+      const reply = { to: '61468104118', from: '61412345678', message: 'STOP', type: 'inbound', received_at: '2026-11-04 09:00:00' };
+      service.acceptInbound(reply);
+      service.acceptInbound(reply);
+      service.acceptInbound({ ...reply, to: '61400000000', from: '61412345679' });
+      expect(store.all('SELECT * FROM sms_inbound')).toHaveLength(1);
+      expect(store.all('SELECT * FROM suppressions')).toHaveLength(1);
+    } finally {
+      if (original === undefined) delete process.env.MOBILEMESSAGE_FROM;
+      else process.env.MOBILEMESSAGE_FROM = original;
+    }
+  });
+  it('sends a test only to the configured recipient and never duplicates a repeated request', async () => {
+    const keys = ['MOBILEMESSAGE_FROM', 'MOBILEMESSAGE_TEST_RECIPIENT', 'SMS_TEST_SEND_ENABLED'];
+    const originals = keys.map(key => process.env[key]);
+    Object.assign(process.env, { MOBILEMESSAGE_FROM: '+61468104118', MOBILEMESSAGE_TEST_RECIPIENT: '+61499918523', SMS_TEST_SEND_ENABLED: 'true' });
+    const provider = jest.spyOn(service, 'provider').mockResolvedValueOnce({ results: [{ sender: '61468104118' }] }).mockResolvedValueOnce({ results: [{ status: 'success', message_id: 'provider-test' }] });
+    try {
+      const request = { requestId: '00000000-0000-4000-8000-000000000123' };
+      const first = await service.sendTest(request);
+      expect(first?.status).toBe('sent');
+      expect(await service.sendTest(request)).toEqual(first);
+      expect(provider).toHaveBeenCalledTimes(2);
+      expect((provider.mock.calls[1][2] as any).messages[0].to).toBe('61499918523');
+      await expect(service.sendTest({ requestId: '00000000-0000-4000-8000-000000000124' })).rejects.toThrow('Wait one minute');
+      expect(store.all('SELECT * FROM contacts')).toHaveLength(0);
+    } finally {
+      provider.mockRestore();
+      keys.forEach((key, i) => { if (originals[i] === undefined) delete process.env[key]; else process.env[key] = originals[i]; });
+    }
+  });
   it('normalizes AU mobiles and rejects non-mobile numbers', () => {
     expect(mobileNumber('0412 345 678')).toBe('+61412345678');
     expect(() => mobileNumber('0399999999')).toThrow();
+  });
+  it('gates SMS activity writes, preserves ambiguous jobs and rejects relinking them', () => {
+    const before = { mode: process.env.DEALERSOCKET_WORKER_MODE, enabled: process.env.DEALERSOCKET_SMS_ACTIVITY_ENABLED };
+    try {
+      process.env.DEALERSOCKET_WORKER_MODE = 'chrome';
+      process.env.DEALERSOCKET_SMS_ACTIVITY_ENABLED = 'false';
+      service.queueSmsActivity('outbound:fixture', row.mobile, 'outbound', 'Test message', '55858', '162482');
+      service.queueSmsActivity('outbound:fixture', row.mobile, 'outbound', 'Test message', '55858', '162482');
+      expect(store.all('SELECT * FROM sms_activity')).toHaveLength(1);
+      expect(service.claimSmsActivity({ authenticated: true })).toEqual({});
+      process.env.DEALERSOCKET_SMS_ACTIVITY_ENABLED = 'true';
+      const job = service.claimSmsActivity({ authenticated: true }) as any;
+      expect(job.contactId).toBe('55858');
+      expect((service.claimSmsActivity({ authenticated: true }) as any).reconcile).toBe(true);
+      expect(() => service.linkSmsActivity(job.id, { contactId: '55858', opportunityId: '162482' })).toThrow();
+      service.finishSmsActivity(job.id, { state: 'needs_review' });
+      expect(service.claimSmsActivity({ authenticated: true })).toEqual({});
+    } finally {
+      if (before.mode === undefined) delete process.env.DEALERSOCKET_WORKER_MODE; else process.env.DEALERSOCKET_WORKER_MODE = before.mode;
+      if (before.enabled === undefined) delete process.env.DEALERSOCKET_SMS_ACTIVITY_ENABLED; else process.env.DEALERSOCKET_SMS_ACTIVITY_ENABLED = before.enabled;
+    }
   });
   it('deduplicates normalized numbers and requires consent evidence', () => {
     const result = service.importContacts({
@@ -158,6 +213,7 @@ describe('Campaign controls', () => {
       expect(first.leadId).toBe(lead.id);
       expect(first.salesManager).toBe('sm');
       expect(first.generalManager).toBe('gm');
+      expect(() => service.finishChromeJob(lead.id, { state: 'synced', opportunityId: '0' })).toThrow();
       expect(
         (service.claimChromeJob({ authenticated: true }) as any).reconcile,
       ).toBe(true);

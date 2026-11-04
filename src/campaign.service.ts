@@ -4,7 +4,7 @@ import {
   Injectable,
   ServiceUnavailableException,
 } from '@nestjs/common';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { CampaignStore } from './campaign.store';
 import { spawn } from 'node:child_process';
 import { resolve } from 'node:path';
@@ -46,13 +46,26 @@ const frequency = () => ({
 @Injectable()
 export class CampaignService {
   private worker?: ReturnType<typeof setInterval>;
+  private inboxWorker?: ReturnType<typeof setInterval>;
+  private inboxSyncing = false;
   private syncing = false;
   onModuleInit() {
     this.worker = setInterval(() => void this.syncQueue(), 10000);
     this.worker.unref();
+    if (process.env.SMS_INBOX_POLL_ENABLED === 'true') {
+      this.inboxWorker = setInterval(() => {
+        if (this.inboxSyncing) return;
+        this.inboxSyncing = true;
+        void this.smsInbox(true).catch(() => {
+          this.store.audit('SMS inbox refresh failed', 'Check Mobile Message connectivity; stored replies remain available.');
+        }).finally(() => { this.inboxSyncing = false; });
+      }, 60000);
+      this.inboxWorker.unref();
+    }
   }
   onModuleDestroy() {
     if (this.worker) clearInterval(this.worker);
+    if (this.inboxWorker) clearInterval(this.inboxWorker);
   }
   constructor(readonly store: CampaignStore) {}
   catalog() {
@@ -217,7 +230,7 @@ export class CampaignService {
     if (
       !['synced', 'needs_review', 'needs_match'].includes(input.state) ||
       (input.state === 'synced' &&
-        !/^\d+$/.test(String(input.opportunityId || '')))
+        !/^[1-9]\d*$/.test(String(input.opportunityId || '')))
     )
       throw new BadRequestException('Invalid worker result.');
     const job = this.store.one('SELECT * FROM outbox WHERE leadId=?', id);
@@ -242,6 +255,8 @@ export class CampaignService {
         : 'Operator review required',
     );
     if (input.state === 'synced' && /^\d+$/.test(String(input.contactId || '')))
+      this.store.run("INSERT INTO settings VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", `crm-opportunity:${input.contactId}`, String(input.opportunityId));
+    if (input.state === 'synced' && /^\d+$/.test(String(input.contactId || '')))
       this.store.run(
         'UPDATE leads SET dealerSocketContactId=? WHERE id=?',
         String(input.contactId),
@@ -257,7 +272,7 @@ export class CampaignService {
     return {
       ...(saved
         ? JSON.parse(saved.value)
-        : { salesManager: 's7xmrobins', generalManager: '', franchise: '1' }),
+        : { salesManager: '', generalManager: '', franchise: '1' }),
       catalog: this.catalog(),
     };
   }
@@ -330,6 +345,8 @@ export class CampaignService {
         sendingEnabled: process.env.CAMPAIGN_SEND_ENABLED === 'true',
         senderRegistered: process.env.SMS_SENDER_REGISTERED === 'true',
         senderId: process.env.MOBILEMESSAGE_FROM || 'Not configured',
+        testRecipient: process.env.MOBILEMESSAGE_TEST_RECIPIENT || '',
+        testSendingEnabled: process.env.SMS_TEST_SEND_ENABLED === 'true',
         publicUrl: Boolean(process.env.PUBLIC_PORTAL_URL),
         dealerSocket: Boolean(
           process.env.DEALERSOCKET_CONNECTOR_URL &&
@@ -506,6 +523,102 @@ export class CampaignService {
     this.store.audit('Copy approved', campaign.name);
     return { approved: true };
   }
+  acceptInbound(input: any) {
+    const configured = mobileNumber(process.env.MOBILEMESSAGE_FROM);
+    if (mobileNumber(input.to) !== configured) return { accepted: true, ignored: true };
+    const mobile = mobileNumber(input.sender || input.from);
+    const body = text(input.message, 4000), received = text(input.received_at, 40);
+    if (!received) throw new BadRequestException('Inbound timestamp is required.');
+    const ref = text(input.original_custom_ref);
+    const id = createHash('sha256').update(JSON.stringify([mobile, configured, body, received, ref])).digest('hex');
+    this.store.run('INSERT OR IGNORE INTO sms_inbound VALUES(?,?,?,?,?,?,?)', id, mobile, configured, body, text(input.type), ref, received);
+    if (input.type === 'unsubscribe' || /^(STOP|UNSUBSCRIBE|CANCEL|END|QUIT)$/i.test(body))
+      this.suppress(mobile, 'Provider opt-out');
+    const original = this.store.one('SELECT m.id,c.mobile,c.dealerSocketContactId FROM messages m JOIN contacts c ON c.id=m.contactId WHERE m.id=? OR m.providerId=?', ref, text(input.original_message_id));
+    // Never copy unrelated account conversations into this dealership's CRM.
+    if (original && original.mobile === mobile)
+      this.queueSmsActivity(`inbound:${id}`, mobile, 'inbound', body, original.dealerSocketContactId);
+    return { accepted: true };
+  }
+  queueSmsActivity(sourceRef: string, mobile: string, direction: string, body: string, contactId?: string, opportunityId?: string) {
+    this.store.run("INSERT OR IGNORE INTO sms_activity(id,sourceRef,mobile,direction,body,contactId,opportunityId,status,createdAt) VALUES(?,?,?,?,?,?,?,'pending',?)", randomUUID(), sourceRef, mobileNumber(mobile), direction, text(body, 4000), contactId || null, opportunityId || null, now());
+  }
+  claimSmsActivity(input: any = {}) {
+    if (input.authenticated !== true || process.env.DEALERSOCKET_WORKER_MODE !== 'chrome' || process.env.DEALERSOCKET_SMS_ACTIVITY_ENABLED !== 'true') return {};
+    return this.store.transaction(() => {
+      const running = this.store.one("SELECT * FROM sms_activity WHERE status='writing' ORDER BY createdAt LIMIT 1");
+      if (running) return { ...running, reconcile: true };
+      const job = this.store.one("SELECT * FROM sms_activity WHERE status='pending' ORDER BY createdAt LIMIT 1");
+      if (!job) return {};
+      if (!job.contactId) {
+        const matched = this.store.all('SELECT DISTINCT dealerSocketContactId AS id FROM leads WHERE mobile=? AND dealerSocketContactId IS NOT NULL UNION SELECT DISTINCT dealerSocketContactId AS id FROM contacts WHERE mobile=? AND dealerSocketContactId IS NOT NULL', job.mobile, job.mobile);
+        if (matched.length === 1) job.contactId = matched[0].id;
+      }
+      if (!job.opportunityId && job.contactId)
+        job.opportunityId = this.store.one('SELECT value FROM settings WHERE key=?', `crm-opportunity:${job.contactId}`)?.value;
+      if (!job.opportunityId && job.contactId) {
+        const snapshot = this.chromeSnapshot();
+        const ids = [...new Set((snapshot?.records || []).filter((r: any) => r.dealership_id === '10876' && r.rooftop === 'South Morang Hyundai' && r.customer_id === job.contactId).map((r: any) => String(r.opportunity_id)))];
+        if (ids.length === 1 && /^\d+$/.test(String(ids[0]))) job.opportunityId = ids[0];
+      }
+      this.store.run("UPDATE sms_activity SET status='writing',contactId=?,opportunityId=? WHERE id=?", job.contactId || null, job.opportunityId || null, job.id);
+      return job;
+    });
+  }
+  finishSmsActivity(id: string, input: any) {
+    if (!['synced', 'needs_match', 'needs_review'].includes(input.state)) throw new BadRequestException('Invalid SMS activity outcome.');
+    const job = this.store.one('SELECT * FROM sms_activity WHERE id=?', id);
+    if (!job) throw new BadRequestException('SMS activity not found.');
+    if (job.status === 'synced') return { accepted: true };
+    if (job.status !== 'writing') throw new ConflictException('SMS activity is not being processed.');
+    this.store.run('UPDATE sms_activity SET status=?,detail=? WHERE id=?', input.state, input.state === 'synced' ? 'Verified in DealerSocket opportunity work notes' : 'Operator review required; no automatic replay', id);
+    return { accepted: true };
+  }
+  linkSmsActivity(id: string, input: any) {
+    if (!/^\d+$/.test(String(input.contactId || '')) || !/^\d+$/.test(String(input.opportunityId || ''))) throw new BadRequestException('Customer and opportunity IDs are required.');
+    const job = this.store.one('SELECT status FROM sms_activity WHERE id=?', id);
+    if (!job || !['pending', 'needs_match'].includes(job.status)) throw new ConflictException('Only an unmatched SMS activity can be linked.');
+    this.store.run("UPDATE sms_activity SET contactId=?,opportunityId=?,status='pending',detail='' WHERE id=?", String(input.contactId), String(input.opportunityId), id);
+    this.store.audit('SMS activity customer linked', 'Chrome must verify site, customer, mobile and opportunity before saving.');
+    return { linked: true };
+  }
+  async smsInbox(sync = false) {
+    let truncated = false;
+    if (sync) {
+      for (let offset = 0; offset < 2000; offset += 200) {
+        const page = await this.provider(`inbound?limit=200&offset=${offset}&from=${new Date(Date.now() - 30 * 86400000).toISOString().slice(0, 10)}`);
+        if (!Array.isArray(page.results)) throw new ServiceUnavailableException('Invalid provider inbox response.');
+        for (const item of page.results) this.acceptInbound(item);
+        if (page.results.length < 200) break;
+        if (offset === 1800) truncated = true;
+      }
+    }
+    return { results: this.store.all('SELECT * FROM sms_inbound ORDER BY receivedAt DESC LIMIT 100'), tests: this.store.all('SELECT * FROM sms_tests ORDER BY createdAt DESC LIMIT 10'), activities: this.store.all('SELECT id,mobile,direction,status,detail,createdAt FROM sms_activity ORDER BY createdAt DESC LIMIT 100'), truncated };
+  }
+  async sendTest(input: { requestId?: string }) {
+    if (process.env.SMS_TEST_SEND_ENABLED !== 'true') throw new BadRequestException('Test sending is disabled.');
+    if (!/^[a-f0-9-]{36}$/i.test(input.requestId || '')) throw new BadRequestException('A test request UUID is required.');
+    const id = input.requestId!, recipient = mobileNumber(process.env.MOBILEMESSAGE_TEST_RECIPIENT), sender = mobileNumber(process.env.MOBILEMESSAGE_FROM);
+    const previous = this.store.one('SELECT * FROM sms_tests WHERE id=?', id);
+    if (previous) return previous;
+    if (this.store.one('SELECT mobile FROM suppressions WHERE mobile=?', recipient)) throw new BadRequestException('The test recipient is suppressed.');
+    if (this.store.one('SELECT id FROM sms_tests WHERE createdAt>?', new Date(Date.now() - 60000).toISOString())) throw new BadRequestException('Wait one minute before another test.');
+    const senders = await this.provider('senders');
+    if (!senders.results?.some((s: any) => String(s.sender).replace(/^\+/, '') === sender.slice(1))) throw new BadRequestException('The test sender is not approved on this provider account.');
+    // Claim after the asynchronous account check, before any paid send.
+    if (this.store.one('SELECT id FROM sms_tests WHERE id=? OR createdAt>?', id, new Date(Date.now() - 60000).toISOString())) throw new ConflictException('A test is already in progress.');
+    this.store.run("INSERT INTO sms_tests VALUES(?,?,?,'sending',NULL,?)", id, recipient, sender, now());
+    try {
+      const response = await this.provider('messages', 'POST', { messages: [{ to: recipient.slice(1), sender: sender.slice(1), message: 'Booran South Morang Hyundai: Portal connection test only. No customer campaign has been launched. {optout}', custom_ref: id }], ignore_unsubscribes: false, max_parts: 2 }, id);
+      const result = response.results?.[0];
+      const status = result?.status === 'success' ? 'sent' : ['blocked', 'error'].includes(result?.status) ? 'failed' : 'unknown';
+      this.store.run('UPDATE sms_tests SET status=?,providerId=? WHERE id=?', status, result?.message_id || null, id);
+    } catch {
+      this.store.run("UPDATE sms_tests SET status='unknown' WHERE id=?", id);
+    }
+    this.store.audit('Test SMS attempted', 'Configured test recipient only; campaign sending unchanged');
+    return this.store.one('SELECT * FROM sms_tests WHERE id=?', id);
+  }
   async provider(path: string, method = 'GET', body?: unknown, id?: string) {
     const user = process.env.MOBILEMESSAGE_API_USERNAME,
       pass = process.env.MOBILEMESSAGE_API_PASSWORD;
@@ -545,7 +658,7 @@ export class CampaignService {
       );
     const senders = await this.provider('senders');
     if (
-      !senders.results?.some((sender: any) => sender.sender === ready.senderId)
+      !senders.results?.some((sender: any) => String(sender.sender).replace(/^\+/, '') === String(ready.senderId).replace(/^\+/, ''))
     )
       throw new BadRequestException(
         'The configured sender is not approved on the Mobile Message account.',
@@ -645,6 +758,10 @@ export class CampaignService {
         if (result.status === 'blocked')
           this.suppress(m.mobile, 'Provider opt-out');
         if (status === 'sent') sent++;
+        if (status === 'sent') {
+          const contact = this.store.one('SELECT dealerSocketContactId FROM contacts WHERE id=?', m.contactId);
+          this.queueSmsActivity(`outbound:${m.id}`, m.mobile, 'outbound', body, contact?.dealerSocketContactId);
+        }
       } catch {
         this.store.run("UPDATE messages SET status='unknown' WHERE id=?", m.id);
         uncertain++;

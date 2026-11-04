@@ -93,10 +93,10 @@ export class LinkCustomerDto {
 }
 
 export class SaveRoutingDto {
-  @ApiProperty({ example: 's7xmrobins', description: 'Primary assignee username (Sales Manager)' })
+  @ApiProperty({ example: 's7xqtruong', description: 'Primary assignee username (Sales Manager)' })
   salesManager!: string;
 
-  @ApiProperty({ example: 's7xjdoe', description: 'Secondary assignee username (General Manager)' })
+  @ApiProperty({ example: 's7xmrobins', description: 'Secondary assignee username (General Manager)' })
   generalManager!: string;
 }
 

@@ -53,6 +53,42 @@ function authorize(actual: string | undefined, expected: string | undefined) {
 export class CampaignController {
   constructor(private readonly service: CampaignService) {}
 
+  @Post('sms/test')
+  testSms(@Headers('x-portal-key') key: string, @Body() input: { requestId?: string }) {
+    authorize(key, process.env.PORTAL_API_KEY);
+    return this.service.sendTest(input);
+  }
+
+  @Post('worker/chrome/sms/claim')
+  claimSms(@Headers('x-portal-key') key: string, @Body() input: { authenticated?: boolean }) {
+    authorize(key, process.env.PORTAL_API_KEY);
+    return this.service.claimSmsActivity(input);
+  }
+
+  @Post('worker/chrome/sms/results/:id')
+  finishSms(@Headers('x-portal-key') key: string, @Param('id') id: string, @Body() input: { state?: string }) {
+    authorize(key, process.env.PORTAL_API_KEY);
+    return this.service.finishSmsActivity(id, input);
+  }
+
+  @Get('sms/inbox')
+  inbox(@Headers('x-portal-key') key: string) {
+    authorize(key, process.env.PORTAL_API_KEY);
+    return this.service.smsInbox();
+  }
+
+  @Post('sms/activity/:id/customer')
+  linkSms(@Headers('x-portal-key') key: string, @Param('id') id: string, @Body() input: { contactId?: string; opportunityId?: string }) {
+    authorize(key, process.env.PORTAL_API_KEY);
+    return this.service.linkSmsActivity(id, input);
+  }
+
+  @Post('sms/inbox/sync')
+  syncInbox(@Headers('x-portal-key') key: string) {
+    authorize(key, process.env.PORTAL_API_KEY);
+    return this.service.smsInbox(true);
+  }
+
   @ApiTags('DealerSocket & Chrome Worker')
   @ApiSecurity('portal-key')
   @ApiOperation({
@@ -502,6 +538,8 @@ export class CampaignController {
       .digest('hex');
     if (!timingSafeEqual(Buffer.from(expected), Buffer.from(signature)))
       throw new UnauthorizedException('Invalid webhook signature.');
+    if (['inbound', 'unsubscribe'].includes(input.type || '') && (input as any).to)
+      return this.service.acceptInbound(input);
     if (
       input.type === 'unsubscribe' ||
       (input.type === 'inbound' &&
@@ -546,6 +584,11 @@ export class CampaignController {
                 rows.every((r) => r.status === 'delivered')
               ? 'delivered'
               : null;
+          if (status)
+            this.service.store.run(
+              'UPDATE sms_tests SET status=? WHERE providerId=? OR (id=? AND providerId IS NULL)',
+              status, messageId, text(input.custom_ref),
+            );
           if (status)
             this.service.store.run(
               'UPDATE messages SET status=? WHERE providerId=? OR (id=? AND providerId IS NULL)',

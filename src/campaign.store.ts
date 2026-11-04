@@ -20,6 +20,9 @@ export class CampaignStore implements OnModuleDestroy {
       CREATE TABLE IF NOT EXISTS audit(id INTEGER PRIMARY KEY AUTOINCREMENT, action TEXT NOT NULL, detail TEXT NOT NULL, createdAt TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS receipts(messageId TEXT NOT NULL, part INTEGER NOT NULL, total INTEGER NOT NULL, status TEXT NOT NULL, receivedAt TEXT NOT NULL, PRIMARY KEY(messageId,part));
       CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS sms_tests(id TEXT PRIMARY KEY, recipient TEXT NOT NULL, sender TEXT NOT NULL, status TEXT NOT NULL, providerId TEXT, createdAt TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS sms_inbound(id TEXT PRIMARY KEY, mobile TEXT NOT NULL, recipient TEXT NOT NULL, body TEXT NOT NULL, type TEXT NOT NULL, originalRef TEXT NOT NULL, receivedAt TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS sms_activity(id TEXT PRIMARY KEY, sourceRef TEXT UNIQUE NOT NULL, mobile TEXT NOT NULL, direction TEXT NOT NULL, body TEXT NOT NULL, contactId TEXT, opportunityId TEXT, status TEXT NOT NULL, detail TEXT NOT NULL DEFAULT '', createdAt TEXT NOT NULL);
     `);
     for (const table of ['contacts', 'leads'])
       if (
