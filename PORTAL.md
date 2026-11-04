@@ -1,6 +1,6 @@
 # Booran Loyalty Studio
 
-The Next.js portal is in `../sms-campaign`; this NestJS application owns campaign data and sends. The existing Python service in `../metaphor-replacement-api` owns DealerSocket browser automation. Requires Node 22.13+ (built-in SQLite) and the existing Python environment with openpyxl for Excel imports.
+The Next.js portal is in `../sms-campaign`; this NestJS application owns campaign data and sends. The existing Python service in `../metaphor-replacement-api` owns DealerSocket browser automation. Requires Node 22.13+, a MongoDB replica set/Atlas cluster with transaction support, and the existing Python environment with openpyxl for Excel imports. The running application uses MongoDB exclusively.
 
 ## Local operation
 
@@ -17,7 +17,7 @@ For a fresh checkout, `node scripts/setup-local.mjs` creates the backend `.env` 
 
 ## Implemented flows
 
-- Persistent SQLite contacts, consent evidence, global suppression, campaign approval, messages, click tracking, lead registrations, CRM outbox, multipart delivery receipts and audit events.
+- Persistent MongoDB contacts, consent evidence, global suppression, campaign approval, messages, click tracking, lead registrations, CRM outbox, multipart delivery receipts and audit events.
 - CSV and XLSX imports (first worksheet, up to 10,000 records, maximum 5 MB file, bounded decompressed workbook). Columns: `mobile`, `firstName`, `lastName`, `consent`, `evidence`. Consent must be `express` or `inferred`; evidence is mandatory. Importing a number never removes suppression. CRM presence never establishes consent.
 - Campaign templates require Booran identification, `{link}` and `{optout}`; `{firstName}` is optional. Copy is reviewed before approval. A recipient can be queued only once per campaign. Dispatch rechecks suppression and frequency immediately before every provider call. The default cross-campaign limit is one attempted/accepted message per customer in 720 hours, configurable with `SMS_MAX_PER_WINDOW` and `SMS_FREQUENCY_WINDOW_HOURS`. Ambiguous attempts count toward this limit. Campaigns cannot be dispatched twice.
 - Mobile Message uses its documented Basic-auth API, approved sender check, per-message UUID idempotency key, provider unsubscribe enforcement and `{optout}` replacement. Unicode is enabled to preserve copy; it can increase SMS segments. A four-part ceiling is applied. Provider errors/ambiguous responses are retained for reconciliation instead of automatic resending. One authorised connection-test SMS was sent and confirmed delivered; no audience campaign was dispatched.
@@ -60,7 +60,7 @@ Set `MOBILEMESSAGE_FROM` and `MOBILEMESSAGE_TEST_RECIPIENT` to the authorised te
 
 “Refresh SMS replies” imports up to 2,000 account replies from the last 30 days, retains only the configured receiving number and displays the latest 100 stored replies. STOP is immediately suppressed. Signed callbacks use the same storage/deduplication. Test delivery callbacks update test status. SMS_INBOX_POLL_ENABLED enables a 60-second background refresh for replies and STOP handling while local callbacks are unavailable; production signed callbacks remain the immediate notification path. Campaign SMS conversations now enter the durable sms_activity queue. DEALERSOCKET_SMS_ACTIVITY_ENABLED controls Chrome activity writes independently from opportunity creation. Only replies linked to portal campaign messages are queued; unrelated account replies are not copied into DealerSocket. Customer/opportunity IDs must match the verified Hyundai record and mobile before an Add a note UI save. A unique matching snapshot opportunity or a previously synced campaign opportunity can resolve the target; otherwise the portal provides manual linking. Ambiguous writes require operator reconciliation and are not automatically replayed. AJ customer 55858 / opportunity 162482 was used for one labelled integration-test note, verified after reload; a repeated job found the existing marker without adding another note. No SMS was sent to AJ. Dual-manager opportunity creation was verified on opportunity 162549 with the client-confirmed Quoc Truong / Mark Robinson mapping. Cynthia Pace is not used.
 
-The supplied numeric sender is approved for account testing; this does not verify the final branded alphanumeric sender required by the original scope. The supplied MongoDB connection is not used by this portal, whose existing durable store is SQLite. Do not point the Hyundai Chrome worker at another rooftop's connector without verifying its scoped API support.
+The supplied numeric sender is approved for account testing; this does not verify the final branded alphanumeric sender required by the original scope. The portal uses the configured MongoDB cluster and a dedicated sms_campaign database; existing collections in other databases are not modified. Do not point the Hyundai Chrome worker at another rooftop's connector without verifying its scoped API support.
 
 - Confirm the South Morang Hyundai sender. The live account credential check succeeded, but no `BooranSMH` sender was returned. `SMS_SENDER_REGISTERED=true` is an operator confirmation, not a substitute for provider/ACMA registration.
 - Final approved copy and consented audience. DealerSocket manager mappings are now saved and verified.
@@ -69,9 +69,26 @@ The supplied numeric sender is approved for account testing; this does not verif
 - Provision the chosen GoodShowroom subdomain, DNS, TLS and public reverse proxy. Set `PUBLIC_PORTAL_URL=https://<approved-domain>`. DNS ownership/hosting credentials were not supplied.
 - Build both frontend roles: `npm run build` and `npm run build:public`; start with `npm start` and `npm run start:public`. Put the two instances behind separate HTTPS hostnames. The public instance defaults to port 3001 and refuses operator access. Both development launchers bind to loopback.
 - Set `CAMPAIGN_SEND_ENABLED=true` only after the above are confirmed. The existing `MOBILEMESSAGE_ENABLED` flag alone does not enable campaign dispatch. No campaign is scheduled or dispatched automatically.
-- Use HTTPS, rate limiting and an organisation identity provider before exposing this shared-password operator portal publicly. The local preview is loopback-only. Run one backend worker; back up `data/campaign.sqlite` with SQLite's backup API. For multiple application workers, migrate the queue and DB to a shared transactional service.
+- Use HTTPS, rate limiting and an organisation identity provider before exposing this shared-password operator portal publicly. The local preview is loopback-only. Configure Atlas backups/point-in-time recovery according to the selected cluster tier. MongoDB unique indexes, majority writes, transactions and an operation fence protect cross-collection changes and worker claims. Keep one Chrome worker per dealership; its local journal is additional ambiguity protection. There is no SQLite runtime or fallback.
 - If the process stops during a send, reconcile `sending`/`unknown` messages against Mobile Message before retrying. This initial implementation deliberately provides no automatic retry of ambiguous sends.
 
 ## Validation
 
 `npm run build` and `npm test -- --runInBand` in this project; `npm run build` and `npm run build:public` in the frontend; `.venv\Scripts\python.exe -m pytest -q -p no:cacheprovider` in the connector. Browser checks cover operator login, campaign draft creation, CSV deduplication/rejection, manual suppression, Goodshowroom placeholder, 390px viewport layout, the supplied public form's success path, registration suppression and public/operator API isolation. XLSX import was verified against the running backend. QA records are removed after verification. The connection-test SMS is confirmed delivered. The controlled CRM opportunity save and both assignments have also been verified. Audience campaign sends still require final copy, consented list and production end-to-end testing. AJ test registration is deliberately retained as the verified CRM test record.
+
+## MongoDB storage and migration
+
+`MONGODB_URI` is required. It can be set directly in the backend environment or inherited from `SHARED_ENV_FILE`; avoid an empty local value if relying on the shared environment. `MONGODB_DB_NAME=sms_campaign` isolates portal records from other applications on the cluster. The backend waits for MongoDB and indexes before listening. `/api/health` pings the database and reports `storage: mongodb`. No SQLite cache, dual writing or in-memory persistence is used. Catalogs and snapshots are stored in MongoDB settings; old JSON sidecars are only migration inputs.
+
+Collections: contacts, suppressions, campaigns, messages, leads, outbox, audit, receipts, settings, sms_tests, sms_inbound, sms_activity, plus _locks and _migrations (14 collection slots). IDs, event IDs, mobile suppression keys, provider references and job statuses are retained. External SMS/CRM side effects never run inside retryable database transaction callbacks.
+
+Migration commands (from this backend folder):
+
+1. `npm run migrate:sqlite` builds and shows a read-only source summary.
+2. Stop every legacy backend/CRM writer, then run `node scripts/migrate-sqlite.cjs --apply`. The tool creates an SQLite backup under ignored data/backups, imports atomically, rejects conflicting target records and verifies every imported document. It also imports only the verified Hyundai catalog/snapshot.
+3. Before restarting writers, `node scripts/migrate-sqlite.cjs --verify` can compare the frozen source again. After normal operation resumes, target records may legitimately change; do not reimport an outdated source.
+4. Start `npm run start:prod` and the Chrome worker. Compare portal metrics, manager routing, registration/outbox state and SMS history with the saved baseline.
+
+The actual cutover report is stored locally in data/mongodb-migration-report.json. Original data/campaign.sqlite and its backup are retained offline; the application no longer accesses them. Do not restart an old SQLite build against those files after cutover, because that creates two divergent data stores.
+
+`npm test -- --runInBand` and `npm run test:e2e -- --runInBand` use disposable local MongoDB replica sets by default (a MongoDB binary download is required on first use). They test real transactions, concurrent claims, suppression, reporting, HTTP flows and migration rollback/idempotency; SMS is mocked and no CRM writes occur. Optional MONGODB_TEST_URI runs them against a dedicated test cluster with strictly checked temporary database names. Test cleanup cannot drop the application database.

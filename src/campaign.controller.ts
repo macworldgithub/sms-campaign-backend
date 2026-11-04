@@ -54,19 +54,29 @@ export class CampaignController {
   constructor(private readonly service: CampaignService) {}
 
   @Post('sms/test')
-  testSms(@Headers('x-portal-key') key: string, @Body() input: { requestId?: string }) {
+  testSms(
+    @Headers('x-portal-key') key: string,
+    @Body() input: { requestId?: string },
+  ) {
     authorize(key, process.env.PORTAL_API_KEY);
     return this.service.sendTest(input);
   }
 
   @Post('worker/chrome/sms/claim')
-  claimSms(@Headers('x-portal-key') key: string, @Body() input: { authenticated?: boolean }) {
+  claimSms(
+    @Headers('x-portal-key') key: string,
+    @Body() input: { authenticated?: boolean },
+  ) {
     authorize(key, process.env.PORTAL_API_KEY);
     return this.service.claimSmsActivity(input);
   }
 
   @Post('worker/chrome/sms/results/:id')
-  finishSms(@Headers('x-portal-key') key: string, @Param('id') id: string, @Body() input: { state?: string }) {
+  finishSms(
+    @Headers('x-portal-key') key: string,
+    @Param('id') id: string,
+    @Body() input: { state?: string },
+  ) {
     authorize(key, process.env.PORTAL_API_KEY);
     return this.service.finishSmsActivity(id, input);
   }
@@ -78,7 +88,11 @@ export class CampaignController {
   }
 
   @Post('sms/activity/:id/customer')
-  linkSms(@Headers('x-portal-key') key: string, @Param('id') id: string, @Body() input: { contactId?: string; opportunityId?: string }) {
+  linkSms(
+    @Headers('x-portal-key') key: string,
+    @Param('id') id: string,
+    @Body() input: { contactId?: string; opportunityId?: string },
+  ) {
     authorize(key, process.env.PORTAL_API_KEY);
     return this.service.linkSmsActivity(id, input);
   }
@@ -118,7 +132,10 @@ export class CampaignController {
   })
   @ApiBody({ type: ChromeSnapshotDto })
   @ApiResponse({ status: 201, description: 'Snapshot accepted.' })
-  @ApiResponse({ status: 400, description: 'Invalid snapshot scope or rooftop.' })
+  @ApiResponse({
+    status: 400,
+    description: 'Invalid snapshot scope or rooftop.',
+  })
   @ApiResponse({ status: 401, description: 'Unauthorized.' })
   @Post('worker/chrome/snapshot')
   snapshot(
@@ -137,7 +154,10 @@ export class CampaignController {
       'Heartbeat check for Chrome worker that claims the next pending CRM delivery job.',
   })
   @ApiBody({ type: ChromeClaimJobDto, required: false })
-  @ApiResponse({ status: 201, description: 'Assigned job details or refresh request flag.' })
+  @ApiResponse({
+    status: 201,
+    description: 'Assigned job details or refresh request flag.',
+  })
   @ApiResponse({ status: 401, description: 'Unauthorized.' })
   @Post('worker/chrome/claim')
   claim(
@@ -158,7 +178,10 @@ export class CampaignController {
   @ApiParam({ name: 'id', description: 'Lead ID' })
   @ApiBody({ type: ChromeJobResultDto })
   @ApiResponse({ status: 201, description: 'Job result accepted.' })
-  @ApiResponse({ status: 400, description: 'Invalid result or CRM job not found.' })
+  @ApiResponse({
+    status: 400,
+    description: 'Invalid result or CRM job not found.',
+  })
   @ApiResponse({ status: 409, description: 'Job not in writing state.' })
   @Post('worker/chrome/results/:id')
   finish(
@@ -180,8 +203,14 @@ export class CampaignController {
   @ApiParam({ name: 'id', description: 'Lead ID' })
   @ApiBody({ type: LinkCustomerDto })
   @ApiResponse({ status: 201, description: 'Customer linked successfully.' })
-  @ApiResponse({ status: 400, description: 'Invalid contact ID or lead not found.' })
-  @ApiResponse({ status: 409, description: 'Cannot change match while CRM write is in progress.' })
+  @ApiResponse({
+    status: 400,
+    description: 'Invalid contact ID or lead not found.',
+  })
+  @ApiResponse({
+    status: 409,
+    description: 'Cannot change match while CRM write is in progress.',
+  })
   @Post('leads/:id/customer')
   linkCustomer(
     @Headers('x-portal-key') key: string,
@@ -199,7 +228,10 @@ export class CampaignController {
     description:
       'Returns current DealerSocket manager assignments (Primary Sales Manager, Secondary General Manager) and verified user catalog.',
   })
-  @ApiResponse({ status: 200, description: 'Current routing settings and catalog.' })
+  @ApiResponse({
+    status: 200,
+    description: 'Current routing settings and catalog.',
+  })
   @Get('routing')
   routing(@Headers('x-portal-key') key: string) {
     authorize(key, process.env.PORTAL_API_KEY);
@@ -215,7 +247,10 @@ export class CampaignController {
   })
   @ApiBody({ type: SaveRoutingDto })
   @ApiResponse({ status: 201, description: 'Routing configuration saved.' })
-  @ApiResponse({ status: 400, description: 'Invalid or duplicate manager assignments.' })
+  @ApiResponse({
+    status: 400,
+    description: 'Invalid or duplicate manager assignments.',
+  })
   @Post('routing')
   setRouting(
     @Headers('x-portal-key') key: string,
@@ -228,12 +263,17 @@ export class CampaignController {
   @ApiTags('Health & System')
   @ApiOperation({
     summary: 'Service Health Status',
-    description: 'Public health probe endpoint for monitoring and uptime checks.',
+    description:
+      'Public health probe endpoint for monitoring and uptime checks.',
   })
-  @ApiResponse({ status: 200, description: 'Service is operational.', type: HealthResponseDto })
+  @ApiResponse({
+    status: 200,
+    description: 'Service is operational.',
+    type: HealthResponseDto,
+  })
   @Get('health')
-  health(): HealthResponseDto {
-    return { status: 'ok' };
+  async health() {
+    return { status: 'ok', ...(await this.service.store.ping()) };
   }
 
   @ApiTags('Dashboard & Operations')
@@ -258,8 +298,15 @@ export class CampaignController {
       'Imports a batch of contact rows with Spam Act 2003 consent type and audit evidence.',
   })
   @ApiBody({ type: ImportContactsDto })
-  @ApiResponse({ status: 201, description: 'Import summary with count of added, duplicate, and rejected rows.' })
-  @ApiResponse({ status: 400, description: 'Invalid contact data or batch exceeds 10,000 rows.' })
+  @ApiResponse({
+    status: 201,
+    description:
+      'Import summary with count of added, duplicate, and rejected rows.',
+  })
+  @ApiResponse({
+    status: 400,
+    description: 'Invalid contact data or batch exceeds 10,000 rows.',
+  })
   @Post('contacts/import')
   import(
     @Headers('x-portal-key') key: string,
@@ -278,7 +325,10 @@ export class CampaignController {
   })
   @ApiBody({ type: ImportWorkbookDto })
   @ApiResponse({ status: 201, description: 'Import summary.' })
-  @ApiResponse({ status: 400, description: 'Invalid workbook, missing columns, or file exceeds 5 MB.' })
+  @ApiResponse({
+    status: 400,
+    description: 'Invalid workbook, missing columns, or file exceeds 5 MB.',
+  })
   @Post('contacts/import-workbook')
   workbook(
     @Headers('x-portal-key') key: string,
@@ -296,8 +346,14 @@ export class CampaignController {
       'Adds a mobile number to the opt-out suppression list and marks any queued messages as suppressed.',
   })
   @ApiBody({ type: SuppressionDto })
-  @ApiResponse({ status: 201, description: 'Mobile number suppressed successfully.' })
-  @ApiResponse({ status: 400, description: 'Invalid Australian mobile number.' })
+  @ApiResponse({
+    status: 201,
+    description: 'Mobile number suppressed successfully.',
+  })
+  @ApiResponse({
+    status: 400,
+    description: 'Invalid Australian mobile number.',
+  })
   @Post('suppressions')
   suppress(
     @Headers('x-portal-key') key: string,
@@ -315,8 +371,14 @@ export class CampaignController {
       'Creates a new campaign draft. Message body must mention Booran and include {link} and {optout} placeholders.',
   })
   @ApiBody({ type: CreateCampaignDto })
-  @ApiResponse({ status: 201, description: 'Campaign created with assigned ID.' })
-  @ApiResponse({ status: 400, description: 'Validation failed for required placeholders or brand name.' })
+  @ApiResponse({
+    status: 201,
+    description: 'Campaign created with assigned ID.',
+  })
+  @ApiResponse({
+    status: 400,
+    description: 'Validation failed for required placeholders or brand name.',
+  })
   @Post('campaigns')
   create(
     @Headers('x-portal-key') key: string,
@@ -330,17 +392,15 @@ export class CampaignController {
   @ApiSecurity('portal-key')
   @ApiOperation({
     summary: 'Approve Campaign Copy',
-    description: 'Marks a draft campaign copy as approved for operator dispatch.',
+    description:
+      'Marks a draft campaign copy as approved for operator dispatch.',
   })
   @ApiParam({ name: 'id', description: 'Campaign UUID' })
   @ApiResponse({ status: 201, description: 'Campaign approved.' })
   @ApiResponse({ status: 400, description: 'Campaign not found.' })
   @ApiResponse({ status: 409, description: 'Campaign is not in draft status.' })
   @Post('campaigns/:id/approve')
-  approve(
-    @Headers('x-portal-key') key: string,
-    @Param('id') id: string,
-  ) {
+  approve(@Headers('x-portal-key') key: string, @Param('id') id: string) {
     authorize(key, process.env.PORTAL_API_KEY);
     return this.service.approve(id);
   }
@@ -353,14 +413,18 @@ export class CampaignController {
       'Initiates batch SMS transmission through MobileMessage provider, enforcing opt-out suppressions and frequency caps.',
   })
   @ApiParam({ name: 'id', description: 'Campaign UUID' })
-  @ApiResponse({ status: 201, description: 'Dispatch finished with counts of sent and uncertain messages.' })
-  @ApiResponse({ status: 400, description: 'Campaign not approved or prerequisites not configured.' })
+  @ApiResponse({
+    status: 201,
+    description:
+      'Dispatch finished with counts of sent and uncertain messages.',
+  })
+  @ApiResponse({
+    status: 400,
+    description: 'Campaign not approved or prerequisites not configured.',
+  })
   @ApiResponse({ status: 409, description: 'Campaign already dispatched.' })
   @Post('campaigns/:id/send')
-  send(
-    @Headers('x-portal-key') key: string,
-    @Param('id') id: string,
-  ) {
+  send(@Headers('x-portal-key') key: string, @Param('id') id: string) {
     authorize(key, process.env.PORTAL_API_KEY);
     return this.service.send(id);
   }
@@ -372,14 +436,17 @@ export class CampaignController {
     description:
       'Returns current DealerSocket connection status and latest snapshot of leads for South Morang Hyundai.',
   })
-  @ApiResponse({ status: 200, description: 'DealerSocket status and latest snapshot.' })
+  @ApiResponse({
+    status: 200,
+    description: 'DealerSocket status and latest snapshot.',
+  })
   @Get('dealersocket')
   async dealer(@Headers('x-portal-key') key: string) {
     authorize(key, process.env.PORTAL_API_KEY);
     if (process.env.DEALERSOCKET_WORKER_MODE === 'chrome')
       return {
-        session: this.service.chromeStatus(),
-        snapshot: this.service.chromeSnapshot() || {
+        session: await this.service.chromeStatus(),
+        snapshot: (await this.service.chromeSnapshot()) || {
           scope: 'south_morang_hyundai',
           state: 'idle',
           records: [],
@@ -397,7 +464,7 @@ export class CampaignController {
         .connector('leads/status?scope=south_morang_hyundai')
         .catch(() => null),
     ]);
-    const chromeSnapshot = this.service.chromeSnapshot();
+    const chromeSnapshot = await this.service.chromeSnapshot();
     const snapshot =
       liveSnapshot?.scope === 'south_morang_hyundai' &&
       (!chromeSnapshot ||
@@ -466,7 +533,10 @@ export class CampaignController {
       'Retrieves the list of registered sender IDs from the MobileMessage provider account.',
   })
   @ApiResponse({ status: 200, description: 'List of registered sender IDs.' })
-  @ApiResponse({ status: 503, description: 'MobileMessage credentials not configured.' })
+  @ApiResponse({
+    status: 503,
+    description: 'MobileMessage credentials not configured.',
+  })
   @Get('provider')
   provider(@Headers('x-portal-key') key: string) {
     authorize(key, process.env.PORTAL_API_KEY);
@@ -485,15 +555,21 @@ export class CampaignController {
     description: 'Authentication key for lead ingestion (LEAD_WEBHOOK_KEY)',
   })
   @ApiBody({ type: CaptureLeadDto })
-  @ApiResponse({ status: 201, description: 'Lead successfully captured and queued.' })
-  @ApiResponse({ status: 400, description: 'Validation failed for required lead fields.' })
+  @ApiResponse({
+    status: 201,
+    description: 'Lead successfully captured and queued.',
+  })
+  @ApiResponse({
+    status: 400,
+    description: 'Validation failed for required lead fields.',
+  })
   @ApiResponse({ status: 401, description: 'Unauthorized.' })
-  @ApiResponse({ status: 409, description: 'Event ID already registered to a different mobile number.' })
+  @ApiResponse({
+    status: 409,
+    description: 'Event ID already registered to a different mobile number.',
+  })
   @Post('webhooks/leads')
-  lead(
-    @Headers('x-webhook-key') key: string,
-    @Body() input: CaptureLeadDto,
-  ) {
+  lead(@Headers('x-webhook-key') key: string, @Body() input: CaptureLeadDto) {
     authorize(key, process.env.LEAD_WEBHOOK_KEY);
     return this.service.captureLead(input);
   }
@@ -514,10 +590,16 @@ export class CampaignController {
     description: 'HMAC-SHA256 hex digest computed over timestamp + rawBody',
   })
   @ApiBody({ type: MobileMessageWebhookDto })
-  @ApiResponse({ status: 201, description: 'Webhook acknowledged and processed.' })
-  @ApiResponse({ status: 401, description: 'Invalid HMAC signature or expired timestamp.' })
+  @ApiResponse({
+    status: 201,
+    description: 'Webhook acknowledged and processed.',
+  })
+  @ApiResponse({
+    status: 401,
+    description: 'Invalid HMAC signature or expired timestamp.',
+  })
   @Post('webhooks/sms')
-  sms(
+  async sms(
     @Req() req: RawBodyRequest<Request>,
     @Body() input: MobileMessageWebhookDto,
   ) {
@@ -538,7 +620,10 @@ export class CampaignController {
       .digest('hex');
     if (!timingSafeEqual(Buffer.from(expected), Buffer.from(signature)))
       throw new UnauthorizedException('Invalid webhook signature.');
-    if (['inbound', 'unsubscribe'].includes(input.type || '') && (input as any).to)
+    if (
+      ['inbound', 'unsubscribe'].includes(input.type || '') &&
+      (input as any).to
+    )
       return this.service.acceptInbound(input);
     if (
       input.type === 'unsubscribe' ||
@@ -553,51 +638,7 @@ export class CampaignController {
       typeof input.message_id === 'string' &&
       ['delivered', 'failed'].includes(input.status || '')
     ) {
-      const messageId = input.message_id;
-      const part = Number(input.part_number || 1),
-        total = Number(input.total_parts || 1),
-        received = text(input.received_at, 40);
-      if (
-        Number.isInteger(part) &&
-        Number.isInteger(total) &&
-        part > 0 &&
-        part <= total &&
-        total <= 99 &&
-        received
-      ) {
-        this.service.store.transaction(() => {
-          this.service.store.run(
-            'INSERT INTO receipts VALUES(?,?,?,?,?) ON CONFLICT(messageId,part) DO UPDATE SET status=excluded.status,receivedAt=excluded.receivedAt WHERE excluded.receivedAt>receipts.receivedAt',
-            messageId,
-            part,
-            total,
-            input.status || null,
-            received,
-          );
-          const rows = this.service.store.all(
-            'SELECT * FROM receipts WHERE messageId=?',
-            messageId,
-          );
-          const status = rows.some((r) => r.status === 'failed')
-            ? 'failed'
-            : rows.length === total &&
-                rows.every((r) => r.status === 'delivered')
-              ? 'delivered'
-              : null;
-          if (status)
-            this.service.store.run(
-              'UPDATE sms_tests SET status=? WHERE providerId=? OR (id=? AND providerId IS NULL)',
-              status, messageId, text(input.custom_ref),
-            );
-          if (status)
-            this.service.store.run(
-              'UPDATE messages SET status=? WHERE providerId=? OR (id=? AND providerId IS NULL)',
-              status,
-              messageId,
-              text(input.custom_ref),
-            );
-        });
-      }
+      await this.service.recordReceipt(input);
     }
     return { accepted: true };
   }
@@ -608,23 +649,19 @@ export class CampaignController {
     description:
       'Increments message click count, constructs loyalty portal destination with UTM parameters, and returns an HTTP 302 redirect.',
   })
-  @ApiParam({ name: 'token', description: 'Unique 36-character campaign message shortlink token' })
-  @ApiResponse({ status: 302, description: 'Redirected to loyalty experience.' })
+  @ApiParam({
+    name: 'token',
+    description: 'Unique 36-character campaign message shortlink token',
+  })
+  @ApiResponse({
+    status: 302,
+    description: 'Redirected to loyalty experience.',
+  })
   @ApiResponse({ status: 404, description: 'Token not found.' })
   @Get('tracking/:token')
-  tracking(
-    @Param('token') token: string,
-    @Res() res: Response,
-  ) {
-    const message = this.service.store.one(
-      'SELECT id,campaignId FROM messages WHERE token=?',
-      token,
-    );
+  async tracking(@Param('token') token: string, @Res() res: Response) {
+    const message = await this.service.track(token);
     if (!message) return res.status(404).send('Link not found');
-    this.service.store.run(
-      'UPDATE messages SET clicks=clicks+1 WHERE id=?',
-      message.id,
-    );
     const target = new URL(
       process.env.PUBLIC_PORTAL_URL
         ? `${process.env.PUBLIC_PORTAL_URL.replace(/\/$/, '')}/loyalty`

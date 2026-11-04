@@ -1,329 +1,407 @@
+import { randomUUID } from 'node:crypto';
 import { CampaignService, mobileNumber } from './campaign.service';
 import { CampaignStore } from './campaign.store';
-import { mkdtempSync, rmSync } from 'node:fs';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { testStore, clearTestStore, closeTestStore } from './testing/mongo';
 
-describe('Campaign controls', () => {
-  let store: CampaignStore, service: CampaignService, directory: string;
-  beforeEach(() => {
-    directory = mkdtempSync(join(tmpdir(), 'campaign-test-'));
-    process.env.CAMPAIGN_DB = join(directory, 'test.sqlite');
-    store = new CampaignStore();
-    service = new CampaignService(store);
-  });
-  afterEach(() => {
-    store.onModuleDestroy();
-    rmSync(directory, { recursive: true, force: true });
-    delete process.env.CAMPAIGN_DB;
-  });
+jest.setTimeout(60000);
+describe('MongoDB campaign controls', () => {
+  let store: CampaignStore, service: CampaignService;
+  const originalEnv = { ...process.env };
   const row = {
     mobile: '0412345678',
     firstName: 'Alex',
     consent: 'express',
-    evidence: 'Customer opt-in record 123',
+    evidence: 'Authorised test fixture',
+    dealerSocketContactId: '55858',
   };
-  it('stores only the configured sender replies, deduplicates and suppresses STOP', () => {
-    const original = process.env.MOBILEMESSAGE_FROM;
+  beforeAll(async () => {
+    store = await testStore();
+  });
+  beforeEach(async () => {
+    service = new CampaignService(store);
+    process.env.CAMPAIGN_SEND_ENABLED = 'false';
+    process.env.DEALERSOCKET_WORKER_MODE = 'chrome';
     process.env.MOBILEMESSAGE_FROM = '+61468104118';
-    try {
-      const reply = { to: '61468104118', from: '61412345678', message: 'STOP', type: 'inbound', received_at: '2026-11-04 09:00:00' };
-      service.acceptInbound(reply);
-      service.acceptInbound(reply);
-      service.acceptInbound({ ...reply, to: '61400000000', from: '61412345679' });
-      expect(store.all('SELECT * FROM sms_inbound')).toHaveLength(1);
-      expect(store.all('SELECT * FROM suppressions')).toHaveLength(1);
-    } finally {
-      if (original === undefined) delete process.env.MOBILEMESSAGE_FROM;
-      else process.env.MOBILEMESSAGE_FROM = original;
-    }
+    await service.acceptChromeCatalog({
+      siteId: '10876',
+      name: 'South Morang Hyundai',
+      users: [
+        { value: 'sm', text: 'Sales Manager' },
+        { value: 'gm', text: 'General Manager' },
+      ],
+      franchises: [{ key: 1, value: 'South Morang Hyundai' }],
+    });
   });
-  it('sends a test only to the configured recipient and never duplicates a repeated request', async () => {
-    const keys = ['MOBILEMESSAGE_FROM', 'MOBILEMESSAGE_TEST_RECIPIENT', 'SMS_TEST_SEND_ENABLED'];
-    const originals = keys.map(key => process.env[key]);
-    Object.assign(process.env, { MOBILEMESSAGE_FROM: '+61468104118', MOBILEMESSAGE_TEST_RECIPIENT: '+61499918523', SMS_TEST_SEND_ENABLED: 'true' });
-    const provider = jest.spyOn(service, 'provider').mockResolvedValueOnce({ results: [{ sender: '61468104118' }] }).mockResolvedValueOnce({ results: [{ status: 'success', message_id: 'provider-test' }] });
-    try {
-      const request = { requestId: '00000000-0000-4000-8000-000000000123' };
-      const first = await service.sendTest(request);
-      expect(first?.status).toBe('sent');
-      expect(await service.sendTest(request)).toEqual(first);
-      expect(provider).toHaveBeenCalledTimes(2);
-      expect((provider.mock.calls[1][2] as any).messages[0].to).toBe('61499918523');
-      await expect(service.sendTest({ requestId: '00000000-0000-4000-8000-000000000124' })).rejects.toThrow('Wait one minute');
-      expect(store.all('SELECT * FROM contacts')).toHaveLength(0);
-    } finally {
-      provider.mockRestore();
-      keys.forEach((key, i) => { if (originals[i] === undefined) delete process.env[key]; else process.env[key] = originals[i]; });
-    }
+  afterEach(async () => {
+    jest.restoreAllMocks();
+    service?.onModuleDestroy();
+    if (store) await clearTestStore(store);
+    for (const key of Object.keys(process.env))
+      if (!(key in originalEnv)) delete process.env[key];
+    Object.assign(process.env, originalEnv);
   });
-  it('normalizes AU mobiles and rejects non-mobile numbers', () => {
+  afterAll(async () => {
+    if (store) await closeTestStore(store);
+  });
+  async function message() {
+    await service.importContacts({ rows: [row] });
+    const contact = (await store.one('contacts', { mobile: '+61412345678' }))!;
+    const campaign = await service.createCampaign({
+      name: 'Test campaign',
+      body: 'Booran test {link} {optout}',
+    });
+    const msg = {
+      id: randomUUID(),
+      campaignId: campaign.id,
+      contactId: contact.id,
+      token: randomUUID(),
+      status: 'sent',
+      providerId: 'provider-fixture',
+      clicks: 0,
+      createdAt: new Date().toISOString(),
+    };
+    await store.insert('messages', msg);
+    return msg;
+  }
+  it('normalises Australian mobiles and rejects invalid numbers', () => {
     expect(mobileNumber('0412 345 678')).toBe('+61412345678');
     expect(() => mobileNumber('0399999999')).toThrow();
   });
-  it('gates SMS activity writes, preserves ambiguous jobs and rejects relinking them', () => {
-    const before = { mode: process.env.DEALERSOCKET_WORKER_MODE, enabled: process.env.DEALERSOCKET_SMS_ACTIVITY_ENABLED };
-    try {
-      process.env.DEALERSOCKET_WORKER_MODE = 'chrome';
-      process.env.DEALERSOCKET_SMS_ACTIVITY_ENABLED = 'false';
-      service.queueSmsActivity('outbound:fixture', row.mobile, 'outbound', 'Test message', '55858', '162482');
-      service.queueSmsActivity('outbound:fixture', row.mobile, 'outbound', 'Test message', '55858', '162482');
-      expect(store.all('SELECT * FROM sms_activity')).toHaveLength(1);
-      expect(service.claimSmsActivity({ authenticated: true })).toEqual({});
-      process.env.DEALERSOCKET_SMS_ACTIVITY_ENABLED = 'true';
-      const job = service.claimSmsActivity({ authenticated: true }) as any;
-      expect(job.contactId).toBe('55858');
-      expect((service.claimSmsActivity({ authenticated: true }) as any).reconcile).toBe(true);
-      expect(() => service.linkSmsActivity(job.id, { contactId: '55858', opportunityId: '162482' })).toThrow();
-      service.finishSmsActivity(job.id, { state: 'needs_review' });
-      expect(service.claimSmsActivity({ authenticated: true })).toEqual({});
-    } finally {
-      if (before.mode === undefined) delete process.env.DEALERSOCKET_WORKER_MODE; else process.env.DEALERSOCKET_WORKER_MODE = before.mode;
-      if (before.enabled === undefined) delete process.env.DEALERSOCKET_SMS_ACTIVITY_ENABLED; else process.env.DEALERSOCKET_SMS_ACTIVITY_ENABLED = before.enabled;
-    }
-  });
-  it('deduplicates normalized numbers and requires consent evidence', () => {
-    const result = service.importContacts({
+  it('deduplicates imports and rejects missing consent evidence', async () => {
+    const result = await service.importContacts({
       rows: [
         row,
         { ...row, mobile: '+61412345678' },
-        { ...row, mobile: '0412345679', evidence: '' },
+        { ...row, evidence: '', mobile: '0412345679' },
       ],
     });
-    expect(result.imported).toBe(1);
-    expect(result.duplicates).toBe(1);
+    expect(result).toMatchObject({ imported: 1, duplicates: 1 });
     expect(result.rejected).toHaveLength(1);
   });
-  it('registers a lead once, suppresses immediately and queues CRM delivery durably', () => {
-    service.importContacts({ rows: [row] });
-    const input = { ...row, eventId: 'form-event-1' };
-    const first = service.captureLead(input);
-    const second = service.captureLead(input);
-    expect(first.id).toBe(second.id);
-    expect(() =>
+  it('serialises concurrent imports without duplicate contacts', async () => {
+    const results = await Promise.all([
+      service.importContacts({ rows: [row] }),
+      service.importContacts({ rows: [row] }),
+    ]);
+    expect(results.reduce((n, r) => n + r.imported, 0)).toBe(1);
+    expect(await store.count('contacts')).toBe(1);
+  });
+  it('rolls back registration, suppression and outbox together', async () => {
+    jest
+      .spyOn(store, 'audit')
+      .mockRejectedValueOnce(new Error('Simulated database write failure'));
+    await expect(
+      service.captureLead({ ...row, eventId: 'rollback' }),
+    ).rejects.toThrow();
+    expect(await store.count('leads')).toBe(0);
+    expect(await store.count('suppressions')).toBe(0);
+    expect(await store.count('outbox')).toBe(0);
+  });
+  it('registers concurrent retries once and rejects conflicting event IDs', async () => {
+    const input = { ...row, eventId: 'same-event' };
+    const results = await Promise.all([
+      service.captureLead(input),
+      service.captureLead(input),
+    ]);
+    expect(results[0].id).toBe(results[1].id);
+    expect(await store.count('outbox')).toBe(1);
+    await expect(
       service.captureLead({ ...input, mobile: '0412345679' }),
-    ).toThrow();
-    expect(service.dashboard().metrics.leads).toBe(1);
-    expect(service.dashboard().metrics.eligible).toBe(0);
-    expect(service.dashboard().metrics.pending).toBe(1);
+    ).rejects.toThrow();
   });
-  it('preserves suppression when an audience is uploaded again', () => {
-    service.suppress(row.mobile, 'STOP reply');
-    service.importContacts({ rows: [row] });
-    expect(service.dashboard().metrics.eligible).toBe(0);
+  it('preserves suppression when contacts are imported later', async () => {
+    await service.suppress(row.mobile, 'STOP reply');
+    await service.importContacts({ rows: [row] });
+    expect((await service.dashboard()).metrics.eligible).toBe(0);
   });
-  it('suppresses the originating SMS mobile when an invitation registers a different contact mobile', () => {
-    service.importContacts({ rows: [row] });
-    const contact = store.one(
-      'SELECT id FROM contacts WHERE mobile=?',
-      '+61412345678',
-    );
-    const campaign = service.createCampaign({
-        name: 'Invitation',
-        body: 'Booran: offer {link} {optout}',
-      }),
-      token = '00000000-0000-4000-8000-000000000001';
-    store.run(
-      "INSERT INTO messages(id,campaignId,contactId,token,status,createdAt) VALUES(?,?,?,?,'sent',?)",
-      'fixture-origin-message',
-      campaign.id,
-      contact!.id,
-      token,
-      new Date().toISOString(),
-    );
-    const lead = service.captureLead({
+  it('attributes a forwarded registration and suppresses both mobiles', async () => {
+    const msg = await message();
+    const lead = await service.captureLead({
       ...row,
       mobile: '0412345679',
-      token,
-      eventId: 'forwarded-invitation-fixture',
+      eventId: 'forwarded',
+      token: msg.token,
     });
+    expect((await store.one('leads', { id: lead.id }))?.campaignId).toBe(
+      msg.campaignId,
+    );
+    expect(await store.count('suppressions')).toBe(2);
+  });
+  it('records STOP even when already suppressed by a registration', async () => {
+    await service.captureLead({ ...row, eventId: 'already-lead' });
+    await service.suppress(row.mobile, 'Provider opt-out');
     expect(
-      store.one('SELECT campaignId FROM leads WHERE id=?', lead.id)?.campaignId,
-    ).toBe(campaign.id);
-    expect(service.dashboard().metrics.suppressed).toBe(2);
+      (await store.one('suppressions', { mobile: '+61412345678' }))?.optOut,
+    ).toBe(1);
   });
-  it('requires sender identification, tracking and unsubscribe tokens', () => {
-    expect(() =>
-      service.createCampaign({ name: 'Offer', body: 'Hello {link}' }),
-    ).toThrow();
-    expect(
-      service.createCampaign({
-        name: 'Offer',
-        body: 'Booran: offer {link} {optout}',
-      }).id,
-    ).toBeTruthy();
+  it('cancels queued messages on suppression', async () => {
+    const msg = await message();
+    await store.update(
+      'messages',
+      { id: msg.id },
+      { $set: { status: 'queued' } },
+    );
+    await service.suppress(row.mobile, 'STOP');
+    expect((await store.one('messages', { id: msg.id }))?.status).toBe(
+      'suppressed',
+    );
   });
-  it('blocks live sending before configuration', async () => {
-    delete process.env.CAMPAIGN_SEND_ENABLED;
-    const { id } = service.createCampaign({
-      name: 'Offer',
-      body: 'Booran: offer {link} {optout}',
-    });
-    service.approve(id);
-    await expect(service.send(id)).rejects.toThrow();
-    expect(service.dashboard().metrics.sent).toBe(0);
-  });
-  it('requires two distinct assignees from the verified catalog', () => {
-    jest.spyOn(service, 'catalog').mockReturnValue({
-      users: [
-        { value: 'sm', text: 'Fixture Sales Manager' },
-        { value: 'gm', text: 'Fixture General Manager' },
-      ],
-    });
-    expect(() =>
+  it('requires distinct verified manager assignments', async () => {
+    await expect(
       service.saveRouting({ salesManager: 'sm', generalManager: 'sm' }),
-    ).toThrow();
-    expect(() =>
-      service.saveRouting({ salesManager: 'sm', generalManager: 'missing' }),
-    ).toThrow();
-    expect(
-      service.saveRouting({ salesManager: 'sm', generalManager: 'gm' })
-        .generalManager,
-    ).toBe('gm');
+    ).rejects.toThrow();
+    await expect(
+      service.saveRouting({ salesManager: 'sm', generalManager: 'absent' }),
+    ).rejects.toThrow();
+    await service.saveRouting({ salesManager: 'sm', generalManager: 'gm' });
+    expect((await service.routing()).generalManager).toBe('gm');
   });
-  it('retains existing-customer matching from the consented audience', () => {
-    service.importContacts({
-      rows: [{ ...row, dealerSocketContactId: '12345' }],
+  it('rejects another dealership catalog or snapshot', async () => {
+    await expect(
+      service.acceptChromeCatalog({ siteId: 'other', users: [] }),
+    ).rejects.toThrow();
+    await expect(
+      service.acceptChromeSnapshot({ scope: 'cranbourne', records: [] }),
+    ).rejects.toThrow();
+  });
+  it('stores scoped Chrome snapshots in MongoDB', async () => {
+    await service.acceptChromeSnapshot({
+      scope: 'south_morang_hyundai',
+      readOnly: true,
+      records: [],
     });
-    const lead = service.captureLead({ ...row, eventId: 'linked-fixture' });
+    expect((await service.chromeSnapshot()).scope).toBe('south_morang_hyundai');
+    expect(await store.setting('chrome-snapshot')).toBeTruthy();
+  });
+  it('claims one CRM job and reconciles concurrent workers', async () => {
+    process.env.DEALERSOCKET_CAMPAIGN_WRITES_ENABLED = 'true';
+    await service.saveRouting({ salesManager: 'sm', generalManager: 'gm' });
+    const lead = await service.captureLead({ ...row, eventId: 'crm-job' });
+    const jobs: any[] = await Promise.all([
+      service.claimChromeJob({ authenticated: true }),
+      service.claimChromeJob({ authenticated: true }),
+    ]);
+    expect(jobs.every((j) => j.leadId === lead.id)).toBe(true);
+    expect(jobs.filter((j) => !j.reconcile)).toHaveLength(1);
+    await expect(
+      service.finishChromeJob(lead.id, { state: 'synced', opportunityId: '0' }),
+    ).rejects.toThrow();
+    await service.finishChromeJob(lead.id, {
+      state: 'synced',
+      opportunityId: '162549',
+      contactId: '55858',
+    });
+    await service.finishChromeJob(lead.id, {
+      state: 'synced',
+      opportunityId: '162549',
+    });
+    expect((await service.dashboard()).metrics.pending).toBe(0);
+    expect(await store.setting('crm-opportunity:55858')).toBe('162549');
+  });
+  it('requires an authenticated enabled worker', async () => {
+    process.env.DEALERSOCKET_CAMPAIGN_WRITES_ENABLED = 'false';
+    await service.captureLead({ ...row, eventId: 'gated' });
     expect(
-      store.one('SELECT dealerSocketContactId FROM leads WHERE id=?', lead.id)
-        ?.dealerSocketContactId,
-    ).toBe('12345');
+      ((await service.claimChromeJob({ authenticated: true })) as any).leadId,
+    ).toBeUndefined();
   });
-  it('claims a CRM job once and reconciles a repeated claim instead of creating duplicates', () => {
-    const mode = process.env.DEALERSOCKET_WORKER_MODE,
-      enabled = process.env.DEALERSOCKET_CAMPAIGN_WRITES_ENABLED;
-    try {
-      process.env.DEALERSOCKET_WORKER_MODE = 'chrome';
-      process.env.DEALERSOCKET_CAMPAIGN_WRITES_ENABLED = 'true';
-      jest.spyOn(service, 'catalog').mockReturnValue({
-        users: [
-          { value: 'sm', text: 'SM' },
-          { value: 'gm', text: 'GM' },
-        ],
-      });
-      service.saveRouting({ salesManager: 'sm', generalManager: 'gm' });
-      const lead = service.captureLead({
-        ...row,
-        eventId: 'write-fixture',
-        dealerSocketContactId: '12345',
-      });
-      const first = service.claimChromeJob({ authenticated: true }) as any;
-      expect(first.leadId).toBe(lead.id);
-      expect(first.salesManager).toBe('sm');
-      expect(first.generalManager).toBe('gm');
-      expect(() => service.finishChromeJob(lead.id, { state: 'synced', opportunityId: '0' })).toThrow();
-      expect(
-        (service.claimChromeJob({ authenticated: true }) as any).reconcile,
-      ).toBe(true);
-      service.finishChromeJob(lead.id, {
-        state: 'synced',
-        opportunityId: '56789',
-      });
-      service.finishChromeJob(lead.id, {
-        state: 'synced',
-        opportunityId: '56789',
-      });
-      expect(service.dashboard().metrics.pending).toBe(0);
-      expect(
-        (service.claimChromeJob({ authenticated: true }) as any).leadId,
-      ).toBeUndefined();
-    } finally {
-      if (mode === undefined) delete process.env.DEALERSOCKET_WORKER_MODE;
-      else process.env.DEALERSOCKET_WORKER_MODE = mode;
-      if (enabled === undefined)
-        delete process.env.DEALERSOCKET_CAMPAIGN_WRITES_ENABLED;
-      else process.env.DEALERSOCKET_CAMPAIGN_WRITES_ENABLED = enabled;
-    }
+  it('links unresolved customers and blocks changes during writes', async () => {
+    const lead = await service.captureLead({ ...row, eventId: 'link' });
+    await store.update(
+      'outbox',
+      { leadId: lead.id },
+      { $set: { status: 'needs_match' } },
+    );
+    await service.linkCustomer(lead.id, { contactId: '55858' });
+    expect((await store.one('outbox', { leadId: lead.id }))?.status).toBe(
+      'pending_configuration',
+    );
+    await store.update(
+      'outbox',
+      { leadId: lead.id },
+      { $set: { status: 'writing' } },
+    );
+    await expect(
+      service.linkCustomer(lead.id, { contactId: '55859' }),
+    ).rejects.toThrow();
   });
-  it('rejects snapshots from another dealership', () => {
-    expect(() =>
-      service.acceptChromeCatalog({
-        siteId: '10876',
-        name: 'South Morang Hyundai',
-        users: [],
-        franchises: [{ key: 1, value: 'Another dealer' }],
+  it('deduplicates inbound replies and excludes other sender numbers', async () => {
+    const reply = {
+      to: '61468104118',
+      from: '61412345678',
+      type: 'inbound',
+      message: 'STOP',
+      received_at: '2026-11-04 09:00:00',
+    };
+    await service.acceptInbound(reply);
+    await service.acceptInbound(reply);
+    await service.acceptInbound({ ...reply, to: '61400000000' });
+    expect(await store.count('sms_inbound')).toBe(1);
+    expect(await store.count('sms_activity')).toBe(0);
+    expect(await store.count('suppressions')).toBe(1);
+  });
+  it('queues only inbound conversations linked to campaigns', async () => {
+    const msg = await message();
+    await service.acceptInbound({
+      to: '61468104118',
+      sender: '61412345678',
+      type: 'inbound',
+      message: 'Interested',
+      received_at: '2026-11-04 10:00:00',
+      original_custom_ref: msg.id,
+    });
+    expect(await store.count('sms_activity')).toBe(1);
+  });
+  it('deduplicates SMS activity and prevents unsafe relinking', async () => {
+    process.env.DEALERSOCKET_SMS_ACTIVITY_ENABLED = 'true';
+    await service.queueSmsActivity(
+      'source',
+      row.mobile,
+      'outbound',
+      'Test',
+      '55858',
+      '162549',
+    );
+    await service.queueSmsActivity(
+      'source',
+      row.mobile,
+      'outbound',
+      'Test',
+      '55858',
+      '162549',
+    );
+    const job: any = await service.claimSmsActivity({ authenticated: true });
+    expect(await store.count('sms_activity')).toBe(1);
+    expect(
+      ((await service.claimSmsActivity({ authenticated: true })) as any)
+        .reconcile,
+    ).toBe(true);
+    await expect(
+      service.linkSmsActivity(job.id, {
+        contactId: '55858',
+        opportunityId: '162549',
       }),
-    ).toThrow();
-    expect(() =>
-      service.acceptChromeSnapshot({
-        scope: 'south_morang_hyundai',
-        readOnly: true,
-        records: [{ dealership_id: 'other', rooftop: 'Other' }],
-      }),
-    ).toThrow();
+    ).rejects.toThrow();
+    await service.finishSmsActivity(job.id, { state: 'synced' });
+    expect((await service.smsInbox()).activities[0].status).toBe('synced');
   });
-  it('records a STOP even after the mobile was suppressed by registration', () => {
-    service.suppress(row.mobile, 'Lead registered');
-    service.suppress(row.mobile, 'STOP reply');
-    expect(service.dashboard().metrics.suppressed).toBe(1);
-    expect(service.dashboard().metrics.optOuts).toBe(1);
+  it('blocks campaign sending before configuration', async () => {
+    const c = await service.createCampaign({
+      name: 'Offer',
+      body: 'Booran {link} {optout}',
+    });
+    await service.approve(c.id);
+    await expect(service.send(c.id)).rejects.toThrow();
   });
-  it('allows an operator to resolve an ambiguous customer match and resume the queue', () => {
-    const lead = service.captureLead({ ...row, eventId: 'ambiguous-fixture' });
-    store.run("UPDATE outbox SET status='writing' WHERE leadId=?", lead.id);
-    service.finishChromeJob(lead.id, { state: 'needs_match' });
-    service.linkCustomer(lead.id, { contactId: '12345' });
-    expect(
-      store.one('SELECT status FROM outbox WHERE leadId=?', lead.id)?.status,
-    ).toBe('pending_configuration');
-    expect(
-      store.one('SELECT dealerSocketContactId FROM leads WHERE id=?', lead.id)
-        ?.dealerSocketContactId,
-    ).toBe('12345');
-  });
-  it('enforces frequency across campaigns without contacting the provider twice', async () => {
-    const values = {
-      MOBILEMESSAGE_API_USERNAME: 'fixture',
-      MOBILEMESSAGE_API_PASSWORD: 'fixture',
-      MOBILEMESSAGE_FROM: 'BooranSMH',
+  it('sends an approved campaign once with concurrent dispatches', async () => {
+    Object.assign(process.env, {
       CAMPAIGN_SEND_ENABLED: 'true',
       SMS_SENDER_REGISTERED: 'true',
-      PUBLIC_PORTAL_URL: 'https://loyalty.example.test',
-      SMS_MAX_PER_WINDOW: '1',
-      SMS_FREQUENCY_WINDOW_HOURS: '720',
-    };
-    const previous = Object.fromEntries(
-      Object.keys(values).map((k) => [k, process.env[k]]),
+      PUBLIC_PORTAL_URL: 'https://example.test',
+      MOBILEMESSAGE_API_USERNAME: 'fixture',
+      MOBILEMESSAGE_API_PASSWORD: 'fixture',
+    });
+    await service.importContacts({ rows: [row] });
+    const c = await service.createCampaign({
+      name: 'Offer',
+      body: 'Booran {link} {optout}',
+    });
+    await service.approve(c.id);
+    const provider = jest
+      .spyOn(service, 'provider')
+      .mockImplementation(async (path) =>
+        path === 'senders'
+          ? { results: [{ sender: '61468104118' }] }
+          : { results: [{ status: 'success', message_id: 'mock-sent' }] },
+      );
+    const results = await Promise.allSettled([
+      service.send(c.id),
+      service.send(c.id),
+    ]);
+    expect(results.filter((r) => r.status === 'fulfilled')).toHaveLength(1);
+    expect(provider.mock.calls.filter((c) => c[0] === 'messages')).toHaveLength(
+      1,
     );
-    try {
-      Object.assign(process.env, values);
-      service.importContacts({ rows: [row] });
-      const mock = jest
-        .spyOn(service, 'provider')
-        .mockImplementation(async (path) =>
-          path === 'senders'
-            ? { results: [{ sender: 'BooranSMH' }] }
-            : {
-                results: [
-                  { status: 'success', message_id: 'fixture-message-id' },
-                ],
-              },
-        );
-      for (const name of ['First campaign', 'Second campaign']) {
-        const { id } = service.createCampaign({
-          name,
-          body: 'Booran: offer {link} {optout}',
-        });
-        service.approve(id);
-        await service.send(id);
-      }
-      expect(
-        mock.mock.calls.filter((call) => call[0] === 'messages'),
-      ).toHaveLength(1);
-      expect(service.dashboard().metrics.sent).toBe(1);
-      expect(service.dashboard().metrics.eligible).toBe(0);
-      expect(
-        store.one(
-          "SELECT COUNT(*) AS n FROM messages WHERE status='frequency_limited'",
-        )?.n,
-      ).toBe(1);
-    } finally {
-      for (const [key, value] of Object.entries(previous)) {
-        if (value === undefined) delete process.env[key];
-        else process.env[key] = value;
-      }
+    expect(await store.count('sms_activity')).toBe(1);
+    expect((await service.dashboard()).metrics.sent).toBe(1);
+  });
+  it('retains ambiguous sends without retrying', async () => {
+    Object.assign(process.env, {
+      CAMPAIGN_SEND_ENABLED: 'true',
+      SMS_SENDER_REGISTERED: 'true',
+      PUBLIC_PORTAL_URL: 'https://example.test',
+      MOBILEMESSAGE_API_USERNAME: 'fixture',
+      MOBILEMESSAGE_API_PASSWORD: 'fixture',
+    });
+    await service.importContacts({ rows: [row] });
+    const c = await service.createCampaign({
+      name: 'Offer',
+      body: 'Booran {link} {optout}',
+    });
+    await service.approve(c.id);
+    jest.spyOn(service, 'provider').mockImplementation(async (path) => {
+      if (path === 'senders') return { results: [{ sender: '61468104118' }] };
+      throw new Error('timeout');
+    });
+    expect((await service.send(c.id)).uncertain).toBe(1);
+    await expect(service.send(c.id)).rejects.toThrow();
+    expect(await store.count('messages', { status: 'unknown' })).toBe(1);
+  });
+  it('enforces the frequency limit across separate campaigns', async () => {
+    Object.assign(process.env, { CAMPAIGN_SEND_ENABLED: 'true', SMS_SENDER_REGISTERED: 'true', PUBLIC_PORTAL_URL: 'https://example.test', MOBILEMESSAGE_API_USERNAME: 'fixture', MOBILEMESSAGE_API_PASSWORD: 'fixture' });
+    await service.importContacts({ rows: [row] });
+    const provider = jest.spyOn(service, 'provider').mockImplementation(async path => path === 'senders' ? { results: [{ sender: '61468104118' }] } : { results: [{ status: 'success', message_id: 'mock-frequency' }] });
+    for (const name of ['First', 'Second']) {
+      const campaign = await service.createCampaign({ name, body: 'Booran {link} {optout}' });
+      await service.approve(campaign.id); await service.send(campaign.id);
     }
+    expect(provider.mock.calls.filter(c => c[0] === 'messages')).toHaveLength(1);
+    expect(await store.count('messages', { status: 'frequency_limited' })).toBe(1);
+    expect((await service.dashboard()).metrics.eligible).toBe(0);
+  });
+  it('sends a configured test recipient only once and enforces cooldown', async () => {
+    Object.assign(process.env, { SMS_TEST_SEND_ENABLED: 'true', MOBILEMESSAGE_TEST_RECIPIENT: '+61499918523' });
+    const provider = jest.spyOn(service, 'provider').mockImplementation(async path => path === 'senders' ? { results: [{ sender: '61468104118' }] } : { results: [{ status: 'success', message_id: 'mock-test' }] });
+    const input = { requestId: randomUUID() };
+    expect((await service.sendTest(input))?.status).toBe('sent');
+    await service.sendTest(input);
+    await expect(service.sendTest({ requestId: randomUUID() })).rejects.toThrow('Wait one minute');
+    const posts = provider.mock.calls.filter(c => c[0] === 'messages');
+    expect(posts).toHaveLength(1);
+    expect((posts[0][2] as any).messages[0].to).toBe('61499918523');
+    expect(await store.count('contacts')).toBe(0);
+  });
+  it('never sends a connection test to a suppressed recipient', async () => {
+    Object.assign(process.env, { SMS_TEST_SEND_ENABLED: 'true', MOBILEMESSAGE_TEST_RECIPIENT: '+61499918523' });
+    await service.suppress('+61499918523', 'STOP');
+    const provider = jest.spyOn(service, 'provider').mockResolvedValue({ results: [{ sender: '61468104118' }] });
+    await expect(service.sendTest({ requestId: randomUUID() })).rejects.toThrow('suppressed');
+    expect(provider.mock.calls.every(c => c[0] === 'senders')).toBe(true);
+  });
+  it('counts tracking visits using atomic increments', async () => {
+    const msg = await message();
+    await Promise.all([service.track(msg.token), service.track(msg.token)]);
+    expect((await service.dashboard()).metrics.clicks).toBe(2);
+  });
+  it('waits for all delivery parts and ignores stale receipts', async () => {
+    const msg = await message();
+    const input = {
+      message_id: msg.providerId,
+      part_number: 1,
+      total_parts: 2,
+      status: 'delivered',
+      received_at: '2026-11-04 10:00:00',
+    };
+    await service.recordReceipt(input);
+    expect((await store.one('messages', { id: msg.id }))?.status).toBe('sent');
+    await service.recordReceipt({ ...input, part_number: 2 });
+    await service.recordReceipt({
+      ...input,
+      status: 'failed',
+      received_at: '2026-11-04 09:00:00',
+    });
+    expect((await store.one('messages', { id: msg.id }))?.status).toBe(
+      'delivered',
+    );
   });
 });

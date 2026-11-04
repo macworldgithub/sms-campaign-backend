@@ -1,80 +1,203 @@
-import { Injectable, OnModuleDestroy } from '@nestjs/common';
-import { DatabaseSync } from 'node:sqlite';
-import { mkdirSync } from 'node:fs';
-import { dirname, resolve } from 'node:path';
+import { Injectable, OnModuleDestroy, OnModuleInit } from '@nestjs/common';
+import { AsyncLocalStorage } from 'node:async_hooks';
+import { randomUUID } from 'node:crypto';
+import {
+  MongoClient,
+  type ClientSession,
+  type Db,
+  type Document,
+  type Filter,
+  type Sort,
+  type UpdateFilter,
+} from 'mongodb';
+
+export const COLLECTIONS = [
+  'contacts',
+  'suppressions',
+  'campaigns',
+  'messages',
+  'leads',
+  'outbox',
+  'audit',
+  'receipts',
+  'settings',
+  'sms_tests',
+  'sms_inbound',
+  'sms_activity',
+] as const;
+export type CollectionName = (typeof COLLECTIONS)[number];
 
 @Injectable()
-export class CampaignStore implements OnModuleDestroy {
-  readonly db: DatabaseSync;
-  constructor() {
-    const file = resolve(process.env.CAMPAIGN_DB || 'data/campaign.sqlite');
-    mkdirSync(dirname(file), { recursive: true });
-    this.db = new DatabaseSync(file);
-    this.db.exec(`PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;
-      CREATE TABLE IF NOT EXISTS contacts(id TEXT PRIMARY KEY, mobile TEXT UNIQUE NOT NULL, firstName TEXT NOT NULL, lastName TEXT NOT NULL, consent TEXT NOT NULL, evidence TEXT NOT NULL, createdAt TEXT NOT NULL);
-      CREATE TABLE IF NOT EXISTS suppressions(mobile TEXT PRIMARY KEY, reason TEXT NOT NULL, createdAt TEXT NOT NULL);
-      CREATE TABLE IF NOT EXISTS campaigns(id TEXT PRIMARY KEY, name TEXT NOT NULL, body TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'draft', approved INTEGER NOT NULL DEFAULT 0, createdAt TEXT NOT NULL);
-      CREATE TABLE IF NOT EXISTS messages(id TEXT PRIMARY KEY, campaignId TEXT NOT NULL REFERENCES campaigns(id), contactId TEXT NOT NULL REFERENCES contacts(id), token TEXT UNIQUE NOT NULL, status TEXT NOT NULL, providerId TEXT, clicks INTEGER NOT NULL DEFAULT 0, createdAt TEXT NOT NULL, UNIQUE(campaignId,contactId));
-      CREATE TABLE IF NOT EXISTS leads(id TEXT PRIMARY KEY, mobile TEXT NOT NULL, firstName TEXT NOT NULL, lastName TEXT NOT NULL, email TEXT NOT NULL, campaignId TEXT, createdAt TEXT NOT NULL, eventId TEXT UNIQUE NOT NULL);
-      CREATE TABLE IF NOT EXISTS outbox(id TEXT PRIMARY KEY, leadId TEXT UNIQUE NOT NULL REFERENCES leads(id), status TEXT NOT NULL, detail TEXT NOT NULL, createdAt TEXT NOT NULL);
-      CREATE TABLE IF NOT EXISTS audit(id INTEGER PRIMARY KEY AUTOINCREMENT, action TEXT NOT NULL, detail TEXT NOT NULL, createdAt TEXT NOT NULL);
-      CREATE TABLE IF NOT EXISTS receipts(messageId TEXT NOT NULL, part INTEGER NOT NULL, total INTEGER NOT NULL, status TEXT NOT NULL, receivedAt TEXT NOT NULL, PRIMARY KEY(messageId,part));
-      CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT NOT NULL);
-      CREATE TABLE IF NOT EXISTS sms_tests(id TEXT PRIMARY KEY, recipient TEXT NOT NULL, sender TEXT NOT NULL, status TEXT NOT NULL, providerId TEXT, createdAt TEXT NOT NULL);
-      CREATE TABLE IF NOT EXISTS sms_inbound(id TEXT PRIMARY KEY, mobile TEXT NOT NULL, recipient TEXT NOT NULL, body TEXT NOT NULL, type TEXT NOT NULL, originalRef TEXT NOT NULL, receivedAt TEXT NOT NULL);
-      CREATE TABLE IF NOT EXISTS sms_activity(id TEXT PRIMARY KEY, sourceRef TEXT UNIQUE NOT NULL, mobile TEXT NOT NULL, direction TEXT NOT NULL, body TEXT NOT NULL, contactId TEXT, opportunityId TEXT, status TEXT NOT NULL, detail TEXT NOT NULL DEFAULT '', createdAt TEXT NOT NULL);
-    `);
-    for (const table of ['contacts', 'leads'])
-      if (
-        !this.all(`PRAGMA table_info(${table})`).some(
-          (column) => column.name === 'dealerSocketContactId',
-        )
-      )
-        this.db.exec(
-          `ALTER TABLE ${table} ADD COLUMN dealerSocketContactId TEXT`,
-        );
-    if (
-      !this.all('PRAGMA table_info(suppressions)').some(
-        (column) => column.name === 'optOut',
-      )
-    )
-      this.db.exec(
-        'ALTER TABLE suppressions ADD COLUMN optOut INTEGER NOT NULL DEFAULT 0',
+export class CampaignStore implements OnModuleInit, OnModuleDestroy {
+  client!: MongoClient;
+  db!: Db;
+  private readonly context = new AsyncLocalStorage<ClientSession>();
+  private connecting?: Promise<void>;
+
+  onModuleInit() {
+    return this.connect();
+  }
+  connect() {
+    return (this.connecting ||= this.initialize());
+  }
+  private async initialize() {
+    const uri = process.env.MONGODB_URI;
+    if (!uri)
+      throw new Error(
+        'MONGODB_URI is required; SQLite fallback is not supported.',
       );
-    this.db.exec(
-      "UPDATE suppressions SET optOut=1 WHERE reason!='Lead registered'",
-    );
+    this.client = new MongoClient(uri, {
+      serverSelectionTimeoutMS: 15000,
+      maxPoolSize: 20,
+      retryWrites: true,
+      writeConcern: { w: 'majority' },
+    });
+    await this.client.connect();
+    this.db = this.client.db(process.env.MONGODB_DB_NAME || 'sms_campaign');
+    for (const name of COLLECTIONS) {
+      if (!(await this.db.listCollections({ name }).hasNext()))
+        await this.db.createCollection(name);
+      if (!['suppressions', 'settings', 'receipts'].includes(name))
+        await this.db.collection(name).createIndex({ id: 1 }, { unique: true });
+    }
+    for (const [name, keys] of [
+      ['contacts', { mobile: 1 }],
+      ['suppressions', { mobile: 1 }],
+      ['settings', { key: 1 }],
+      ['messages', { token: 1 }],
+      ['messages', { campaignId: 1, contactId: 1 }],
+      ['leads', { eventId: 1 }],
+      ['outbox', { leadId: 1 }],
+      ['receipts', { messageId: 1, part: 1 }],
+      ['sms_activity', { sourceRef: 1 }],
+    ] as [string, Record<string, 1>][])
+      await this.db.collection(name).createIndex(keys, { unique: true });
+    for (const name of ['outbox', 'sms_activity', 'messages', 'sms_tests'])
+      await this.db.collection(name).createIndex({ status: 1, createdAt: 1 });
+    await this.db
+      .collection('messages')
+      .createIndex({ contactId: 1, createdAt: 1, status: 1 });
+    await this.db.collection('messages').createIndex({ providerId: 1 });
+    await this.db.collection('leads').createIndex({ mobile: 1 });
+    await this.db.collection('sms_inbound').createIndex({ receivedAt: -1 });
+    await this.db.collection('audit').createIndex({ createdAt: -1 });
+    await this.db
+      .collection('_locks')
+      .updateOne(
+        { _id: 'campaign-operations' as any },
+        { $setOnInsert: { version: 0 } },
+        { upsert: true },
+      );
   }
-  all(sql: string, ...params: (string | number | null)[]) {
-    return this.db.prepare(sql).all(...params) as Record<string, any>[];
+  private get options() {
+    return { session: this.context.getStore() };
   }
-  one(sql: string, ...params: (string | number | null)[]) {
-    return this.db.prepare(sql).get(...params) as
-      Record<string, any> | undefined;
+  one(name: CollectionName, filter: Filter<Document> = {}, sort?: Sort) {
+    return this.db
+      .collection(name)
+      .findOne(filter, {
+        ...this.options,
+        projection: { _id: 0 },
+        ...(sort ? { sort } : {}),
+      });
   }
-  run(sql: string, ...params: (string | number | null)[]) {
-    return this.db.prepare(sql).run(...params);
+  find(
+    name: CollectionName,
+    filter: Filter<Document> = {},
+    sort: Sort = {},
+    limit = 0,
+  ) {
+    return this.db
+      .collection(name)
+      .find(filter, { ...this.options, projection: { _id: 0 } })
+      .sort(sort)
+      .limit(limit)
+      .toArray();
   }
-  transaction<T>(fn: () => T): T {
-    this.db.exec('BEGIN IMMEDIATE');
+  count(name: CollectionName, filter: Filter<Document> = {}) {
+    return this.db.collection(name).countDocuments(filter, this.options);
+  }
+  aggregate(name: CollectionName, pipeline: Document[]) {
+    return this.db.collection(name).aggregate(pipeline, this.options).toArray();
+  }
+  insert(name: CollectionName, doc: Document) {
+    return this.db.collection(name).insertOne({ ...doc }, this.options);
+  }
+  async insertMany(name: CollectionName, docs: Document[]) {
+    if (docs.length)
+      await this.db.collection(name).insertMany(
+        docs.map((doc) => ({ ...doc })),
+        this.options,
+      );
+  }
+  update(
+    name: CollectionName,
+    filter: Filter<Document>,
+    update: UpdateFilter<Document>,
+    upsert = false,
+  ) {
+    return this.db
+      .collection(name)
+      .updateOne(filter, update, { ...this.options, upsert });
+  }
+  updateMany(
+    name: CollectionName,
+    filter: Filter<Document>,
+    update: UpdateFilter<Document>,
+  ) {
+    return this.db.collection(name).updateMany(filter, update, this.options);
+  }
+  delete(name: CollectionName, filter: Filter<Document>) {
+    return this.db.collection(name).deleteMany(filter, this.options);
+  }
+  async setting(key: string) {
+    return (await this.one('settings', { key }))?.value;
+  }
+  async setSetting(key: string, value: string) {
+    await this.update('settings', { key }, { $set: { value } }, true);
+  }
+  async transaction<T>(fn: (session: ClientSession) => Promise<T>): Promise<T> {
+    const active = this.context.getStore();
+    if (active) return fn(active);
+    const session = this.client.startSession();
     try {
-      const value = fn();
-      this.db.exec('COMMIT');
-      return value;
-    } catch (error) {
-      this.db.exec('ROLLBACK');
-      throw error;
+      // A common write fence serializes cross-collection claims, suppression and dispatch
+      // decisions across application instances. withTransaction retries write conflicts.
+      return (await session.withTransaction(
+        async () =>
+          this.context.run(session, async () => {
+            await this.db
+              .collection('_locks')
+              .updateOne(
+                { _id: 'campaign-operations' as any },
+                { $inc: { version: 1 } },
+                { session },
+              );
+            return fn(session);
+          }),
+        {
+          readConcern: { level: 'snapshot' },
+          writeConcern: { w: 'majority' },
+          readPreference: 'primary',
+        },
+      )) as T;
+    } finally {
+      await session.endSession();
     }
   }
-  audit(action: string, detail: string) {
-    this.run(
-      'INSERT INTO audit(action,detail,createdAt) VALUES(?,?,?)',
+  async audit(action: string, detail: string) {
+    await this.insert('audit', {
+      id: randomUUID(),
       action,
       detail,
-      new Date().toISOString(),
-    );
+      createdAt: new Date().toISOString(),
+    });
   }
-  onModuleDestroy() {
-    this.db.close();
+  async ping() {
+    await this.db.command({ ping: 1 });
+    return { storage: 'mongodb', database: this.db.databaseName };
+  }
+  async onModuleDestroy() {
+    await this.client?.close();
   }
 }

@@ -8,6 +8,17 @@ import { CampaignStore } from './campaign.store';
 @Module({
   imports: [],
   controllers: [AppController, CampaignController],
-  providers: [AppService, CampaignService, CampaignStore],
+  providers: [
+    AppService,
+    CampaignService,
+    {
+      provide: CampaignStore,
+      useFactory: async () => {
+        const store = new CampaignStore();
+        await store.connect();
+        return store;
+      },
+    },
+  ],
 })
 export class AppModule {}
