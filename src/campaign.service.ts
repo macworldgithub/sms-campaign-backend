@@ -48,13 +48,17 @@ export class CampaignService {
   private inboxSyncing = false;
   private syncing = false;
   constructor(readonly store: CampaignStore) {}
-  onModuleInit() {
+  async onModuleInit() {
+    // Preserve DealerSocket delivery state while staging the second CRM destination.
+    await this.store.updateMany('outbox', { goodshowroomStatus: { $exists: false } }, { $set: {
+      goodshowroomStatus: 'pending_configuration', goodshowroomDetail: 'It will be integrated soon',
+    } });
     this.worker = setInterval(
       () => void this.syncQueue().catch(() => {}),
       10000,
     );
     this.worker.unref();
-    if (process.env.SMS_INBOX_POLL_ENABLED === 'true') {
+    if (this.channelMode() === 'two_way' && process.env.SMS_INBOX_POLL_ENABLED === 'true') {
       this.inboxWorker = setInterval(() => {
         if (this.inboxSyncing) return;
         this.inboxSyncing = true;
@@ -76,6 +80,22 @@ export class CampaignService {
   onModuleDestroy() {
     if (this.worker) clearInterval(this.worker);
     if (this.inboxWorker) clearInterval(this.inboxWorker);
+  }
+  channelMode(): 'one_way' | 'two_way' {
+    return process.env.SMS_CHANNEL_MODE === 'two_way' ? 'two_way' : 'one_way';
+  }
+  publicUrlConfigured() {
+    try {
+      const url = new URL(process.env.PUBLIC_PORTAL_URL || '');
+      return url.protocol === 'https:' && !['localhost', '127.0.0.1', '[::1]'].includes(url.hostname);
+    } catch { return false; }
+  }
+  private validateChannelCopy(body: string) {
+    if (this.channelMode() === 'one_way' && /reply\s+["']?stop\b/i.test(body))
+      throw new BadRequestException('One-way SMS uses a web opt-out link. Remove Reply STOP from the copy.');
+  }
+  private unsubscribeCopy(token: string) {
+    return `Opt out: ${process.env.PUBLIC_PORTAL_URL!.replace(/\/$/, '')}/unsubscribe/${token}`;
   }
   async catalog() {
     const value = await this.store.setting('chrome-catalog');
@@ -303,6 +323,11 @@ export class CampaignService {
   readiness() {
     return {
       storage: 'mongodb',
+      smsChannelMode: this.channelMode(),
+      enquirySource: 'landing_page',
+      unsubscribeMechanism: this.channelMode() === 'one_way' ? 'web_link' : 'provider_instructions',
+      smsInboxEnabled: this.channelMode() === 'two_way',
+      deliveryCallbacksConfigured: Boolean(process.env.MOBILEMESSAGE_WEBHOOK_SECRET),
       provider: Boolean(
         process.env.MOBILEMESSAGE_API_USERNAME &&
         process.env.MOBILEMESSAGE_API_PASSWORD,
@@ -312,12 +337,13 @@ export class CampaignService {
       senderId: process.env.MOBILEMESSAGE_FROM || 'Not configured',
       testRecipient: process.env.MOBILEMESSAGE_TEST_RECIPIENT || '',
       testSendingEnabled: process.env.SMS_TEST_SEND_ENABLED === 'true',
-      publicUrl: Boolean(process.env.PUBLIC_PORTAL_URL),
+      publicUrl: this.publicUrlConfigured(),
       dealerSocket: Boolean(
         process.env.DEALERSOCKET_CONNECTOR_URL &&
         process.env.DEALERSOCKET_CONNECTOR_KEY,
       ),
       goodshowroom: 'It will be integrated soon',
+      goodshowroomStatus: 'pending_configuration',
       dealerSocketMode: process.env.DEALERSOCKET_WORKER_MODE || 'connector',
       frequencyPolicy: `Up to ${frequency().maximum} message(s) per customer every ${frequency().hours} hours`,
       crmWritesEnabled:
@@ -390,6 +416,8 @@ export class CampaignService {
         suppressed: counts[4],
         optOuts: counts[5],
         pending: counts[6],
+        pendingDealerSocket: counts[6],
+        pendingGoodshowroom: await this.store.count('outbox', { goodshowroomStatus: { $ne: 'synced' } }),
       },
       campaigns: await this.store.aggregate('campaigns', [
         { $sort: { createdAt: -1 } },
@@ -444,6 +472,8 @@ export class CampaignService {
           $set: {
             crmStatus: { $arrayElemAt: ['$crm.status', 0] },
             crmDetail: { $arrayElemAt: ['$crm.detail', 0] },
+            goodshowroomStatus: { $ifNull: [{ $arrayElemAt: ['$crm.goodshowroomStatus', 0] }, 'pending_configuration'] },
+            goodshowroomDetail: { $ifNull: [{ $arrayElemAt: ['$crm.goodshowroomDetail', 0] }, 'It will be integrated soon'] },
           },
         },
         { $project: { _id: 0, crm: 0 } },
@@ -558,6 +588,7 @@ export class CampaignService {
       throw new BadRequestException(
         'Provide a name, identify Booran, and include {link} and {optout}.',
       );
+    this.validateChannelCopy(body);
     const id = randomUUID();
     await this.store.transaction(async () => {
       await this.store.insert('campaigns', {
@@ -576,6 +607,7 @@ export class CampaignService {
     return this.store.transaction(async () => {
       const campaign = await this.store.one('campaigns', { id });
       if (!campaign) throw new BadRequestException('Campaign not found.');
+      this.validateChannelCopy(campaign.body);
       if (campaign.status !== 'draft')
         throw new ConflictException('Only a draft can be approved.');
       await this.store.update(
@@ -588,13 +620,18 @@ export class CampaignService {
     });
   }
   async acceptInbound(input: any) {
-    const configured = mobileNumber(process.env.MOBILEMESSAGE_FROM);
-    if (mobileNumber(input.to) !== configured)
+    const configured = String(process.env.MOBILEMESSAGE_FROM || '').replace(/^\+/, '');
+    if (!configured || String(input.to || '').replace(/^\+/, '') !== configured)
       return { accepted: true, ignored: true };
     const mobile = mobileNumber(input.sender || input.from),
       body = text(input.message, 4000),
       received = text(input.received_at, 40),
       ref = text(input.original_custom_ref);
+    if (this.channelMode() === 'one_way') {
+      if (input.type === 'unsubscribe' || /^(STOP|UNSUBSCRIBE|CANCEL|END|QUIT)$/i.test(body))
+        return this.suppress(mobile, 'Provider opt-out');
+      return { accepted: true, ignored: true };
+    }
     if (!received)
       throw new BadRequestException('Inbound timestamp is required.');
     const id = createHash('sha256')
@@ -669,7 +706,7 @@ export class CampaignService {
   }
   async claimSmsActivity(input: any = {}) {
     if (
-      input.authenticated !== true ||
+      this.channelMode() !== 'two_way' || input.authenticated !== true ||
       process.env.DEALERSOCKET_WORKER_MODE !== 'chrome' ||
       process.env.DEALERSOCKET_SMS_ACTIVITY_ENABLED !== 'true'
     )
@@ -799,6 +836,9 @@ export class CampaignService {
     });
   }
   async smsInbox(sync = false) {
+    if (this.channelMode() === 'one_way') {
+      return { results: [], activities: [], tests: await this.store.find('sms_tests', {}, { createdAt: -1 }, 10), truncated: false, channelMode: 'one_way' };
+    }
     let truncated = false;
     if (sync)
       for (let offset = 0; offset < 2000; offset += 200) {
@@ -827,6 +867,18 @@ export class CampaignService {
       truncated,
     };
   }
+  async smsOutbound() {
+    return {
+      channelMode: this.channelMode(),
+      tests: await this.store.find('sms_tests', {}, { createdAt: -1 }, 10),
+      messages: await this.store.aggregate('messages', [
+        { $sort: { createdAt: -1 } }, { $limit: 100 },
+        { $lookup: { from: 'contacts', localField: 'contactId', foreignField: 'id', as: 'contact' } },
+        { $set: { mobile: { $arrayElemAt: ['$contact.mobile', 0] } } },
+        { $project: { _id: 0, contact: 0, token: 0 } },
+      ]),
+    };
+  }
   async sendTest(input: { requestId?: string }) {
     if (process.env.SMS_TEST_SEND_ENABLED !== 'true')
       throw new BadRequestException('Test sending is disabled.');
@@ -837,6 +889,8 @@ export class CampaignService {
       sender = mobileNumber(process.env.MOBILEMESSAGE_FROM);
     const previous = await this.store.one('sms_tests', { id });
     if (previous) return previous;
+    if (this.channelMode() === 'one_way' && !this.publicUrlConfigured())
+      throw new BadRequestException('Configure the public HTTPS loyalty URL before testing one-way SMS with web opt-out.');
     const senders = await this.provider('senders');
     if (
       !senders.results?.some(
@@ -877,8 +931,9 @@ export class CampaignService {
             {
               to: recipient.slice(1),
               sender: sender.slice(1),
-              message:
-                'Booran South Morang Hyundai: Portal connection test only. No customer campaign has been launched. {optout}',
+              message: this.channelMode() === 'one_way'
+                ? `Booran South Morang Hyundai: Portal connection test only. Please do not reply. ${this.unsubscribeCopy(id)}`
+                : 'Booran South Morang Hyundai: Portal connection test only. No customer campaign has been launched. {optout}',
               custom_ref: id,
             },
           ],
@@ -938,6 +993,7 @@ export class CampaignService {
       const c = await this.store.one('campaigns', { id });
       if (!c?.approved)
         throw new BadRequestException('Approve campaign copy first.');
+      this.validateChannelCopy(c.body);
       if (c.status !== 'approved')
         throw new ConflictException('Campaign has already been dispatched.');
       await this.store.update(
@@ -1029,7 +1085,8 @@ export class CampaignService {
       const url = `${process.env.PUBLIC_PORTAL_URL!.replace(/\/$/, '')}/r/${queued.token}`,
         body = campaign.body
           .replaceAll('{link}', url)
-          .replaceAll('{firstName}', contact.firstName || 'there');
+          .replaceAll('{firstName}', contact.firstName || 'there')
+          .replaceAll('{optout}', this.channelMode() === 'one_way' ? this.unsubscribeCopy(queued.token) : '{optout}');
       let result: any;
       try {
         const data = await this.provider(
@@ -1082,7 +1139,7 @@ export class CampaignService {
         );
         if (result.status === 'blocked')
           await this.suppress(contact.mobile, 'Provider opt-out');
-        if (status === 'sent')
+        if (status === 'sent' && this.channelMode() === 'two_way' && process.env.DEALERSOCKET_SMS_ACTIVITY_ENABLED === 'true')
           await this.queueSmsActivity(
             `outbound:${queued.id}`,
             contact.mobile,
@@ -1133,6 +1190,9 @@ export class CampaignService {
         lastName: text(input.lastName),
         email: text(input.email),
         campaignId: message?.campaignId || null,
+        source: 'loyalty_landing_page',
+        contactConsent: input.contactConsent === true,
+        existingCustomer: input.existingCustomer === true,
         createdAt: now(),
         eventId,
         dealerSocketContactId: /^\d+$/.test(
@@ -1148,13 +1208,15 @@ export class CampaignService {
         id: randomUUID(),
         leadId: id,
         status: 'pending_configuration',
+        goodshowroomStatus: 'pending_configuration',
+        goodshowroomDetail: 'It will be integrated soon',
         detail:
           'Waiting for CRM routing, matched customer, and enabled write worker',
         createdAt: now(),
       });
       await this.store.audit(
         'Lead registered',
-        'Further campaign messages suppressed; CRM delivery queued',
+        'Landing-page enquiry captured; SMS suppressed; DealerSocket delivery and GoodShowroom delivery staged independently',
       );
       return { id };
     });
@@ -1255,6 +1317,25 @@ export class CampaignService {
         { $inc: { clicks: 1 } },
       );
     return message;
+  }
+  private async unsubscribeMobile(token: string) {
+    if (!/^[a-f0-9-]{36}$/i.test(token)) throw new BadRequestException('Invalid unsubscribe link.');
+    const message = await this.store.one('messages', { token });
+    if (message) {
+      const contact = await this.store.one('contacts', { id: message.contactId });
+      if (contact?.mobile) return String(contact.mobile);
+    }
+    const test = await this.store.one('sms_tests', { id: token });
+    if (test?.recipient) return String(test.recipient);
+    throw new BadRequestException('This unsubscribe link is unavailable.');
+  }
+  async unsubscribeStatus(token: string) {
+    const mobile = await this.unsubscribeMobile(token);
+    return { valid: true, maskedMobile: `•••• ${mobile.slice(-4)}`, alreadySuppressed: Boolean(await this.store.one('suppressions', { mobile })) };
+  }
+  async unsubscribe(token: string) {
+    const mobile = await this.unsubscribeMobile(token);
+    return this.suppress(mobile, 'Opt-out link');
   }
   async syncQueue() {
     if (

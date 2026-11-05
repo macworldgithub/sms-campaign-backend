@@ -53,6 +53,22 @@ function authorize(actual: string | undefined, expected: string | undefined) {
 export class CampaignController {
   constructor(private readonly service: CampaignService) {}
 
+  @Get('sms/outbound')
+  outbound(@Headers('x-portal-key') key: string) {
+    authorize(key, process.env.PORTAL_API_KEY);
+    return this.service.smsOutbound();
+  }
+
+  @Get('unsubscribe/:token')
+  unsubscribeStatus(@Param('token') token: string) {
+    return this.service.unsubscribeStatus(token);
+  }
+
+  @Post('unsubscribe/:token')
+  unsubscribe(@Param('token') token: string) {
+    return this.service.unsubscribe(token);
+  }
+
   @Post('sms/test')
   testSms(
     @Headers('x-portal-key') key: string,

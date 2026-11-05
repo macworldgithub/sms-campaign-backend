@@ -147,6 +147,11 @@ export class CreateCampaignDto {
 }
 
 export class CaptureLeadDto {
+  @ApiPropertyOptional({ description: 'Permission to respond, confirmed on the loyalty form' })
+  contactConsent?: boolean;
+
+  @ApiPropertyOptional({ description: 'Existing customer eligibility confirmed on the form' })
+  existingCustomer?: boolean;
   @ApiProperty({ example: '+61412345678', description: 'Customer mobile number' })
   mobile!: string;
 

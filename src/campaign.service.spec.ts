@@ -20,6 +20,8 @@ describe('MongoDB campaign controls', () => {
   beforeEach(async () => {
     service = new CampaignService(store);
     process.env.CAMPAIGN_SEND_ENABLED = 'false';
+    process.env.SMS_CHANNEL_MODE = 'two_way';
+    process.env.DEALERSOCKET_SMS_ACTIVITY_ENABLED = 'true';
     process.env.DEALERSOCKET_WORKER_MODE = 'chrome';
     process.env.MOBILEMESSAGE_FROM = '+61468104118';
     await service.acceptChromeCatalog({
@@ -377,6 +379,82 @@ describe('MongoDB campaign controls', () => {
     const provider = jest.spyOn(service, 'provider').mockResolvedValue({ results: [{ sender: '61468104118' }] });
     await expect(service.sendTest({ requestId: randomUUID() })).rejects.toThrow('suppressed');
     expect(provider.mock.calls.every(c => c[0] === 'senders')).toBe(true);
+  });
+  it('renders one-way invitations with a landing link and web opt-out, without creating enquiry or conversation jobs', async () => {
+    Object.assign(process.env, { SMS_CHANNEL_MODE: 'one_way', CAMPAIGN_SEND_ENABLED: 'true', SMS_SENDER_REGISTERED: 'true', PUBLIC_PORTAL_URL: 'https://loyalty.example.test', MOBILEMESSAGE_API_USERNAME: 'fixture', MOBILEMESSAGE_API_PASSWORD: 'fixture' });
+    await service.importContacts({ rows: [row] });
+    const campaign = await service.createCampaign({ name: 'One-way invitation', body: 'Booran loyalty offer {link} {optout}' });
+    await service.approve(campaign.id);
+    const provider = jest.spyOn(service, 'provider').mockImplementation(async path => path === 'senders' ? { results: [{ sender: '61468104118' }] } : { results: [{ status: 'success', message_id: 'one-way-fixture' }] });
+    await service.send(campaign.id);
+    const msg = (await store.one('messages', { campaignId: campaign.id }))!;
+    const payload = provider.mock.calls.find(c => c[0] === 'messages')![2] as any;
+    expect(payload.messages[0].message).toContain(`/r/${msg.token}`);
+    expect(payload.messages[0].message).toContain(`/unsubscribe/${msg.token}`);
+    expect(payload.messages[0].message).not.toMatch(/\{optout\}|reply stop/i);
+    expect(await store.count('leads')).toBe(0);
+    expect(await store.count('outbox')).toBe(0);
+    expect(await store.count('sms_activity')).toBe(0);
+  });
+  it('does not unsubscribe on link preview and suppresses idempotently on confirmation', async () => {
+    const msg = await message();
+    await store.update('messages', { id: msg.id }, { $set: { status: 'queued' } });
+    const preview = await service.unsubscribeStatus(msg.token);
+    expect(preview.maskedMobile).not.toBe('+61412345678');
+    expect(await store.count('suppressions')).toBe(0);
+    await service.unsubscribe(msg.token); await service.unsubscribe(msg.token);
+    expect(await store.count('suppressions')).toBe(1);
+    expect((await store.one('messages', { id: msg.id }))?.status).toBe('suppressed');
+    expect((await store.one('suppressions', { mobile: '+61412345678' }))?.optOut).toBe(1);
+  });
+  it('rejects invalid and unknown unsubscribe tokens without modifying customer preferences', async () => {
+    await expect(service.unsubscribe('invalid')).rejects.toThrow();
+    await expect(service.unsubscribe(randomUUID())).rejects.toThrow();
+    expect(await store.count('suppressions')).toBe(0);
+  });
+  it('keeps DealerSocket and GoodShowroom delivery independent and suppresses on form registration', async () => {
+    Object.assign(process.env, { SMS_CHANNEL_MODE: 'one_way', DEALERSOCKET_CAMPAIGN_WRITES_ENABLED: 'true' });
+    await service.saveRouting({ salesManager: 'sm', generalManager: 'gm' });
+    const input = { ...row, eventId: 'dual-crm-form', contactConsent: true, existingCustomer: true };
+    const lead = await service.captureLead(input); await service.captureLead(input);
+    expect(await store.count('outbox')).toBe(1);
+    expect((await store.one('leads', { id: lead.id }))?.source).toBe('loyalty_landing_page');
+    expect(await store.count('suppressions')).toBe(1);
+    await service.claimChromeJob({ authenticated: true });
+    await service.finishChromeJob(lead.id, { state: 'synced', opportunityId: '162549', contactId: '55858' });
+    const portal = await service.dashboard();
+    expect(portal.leads[0]).toMatchObject({ crmStatus: 'synced', goodshowroomStatus: 'pending_configuration' });
+    expect(portal.metrics.pendingDealerSocket).toBe(0);
+    expect(portal.metrics.pendingGoodshowroom).toBe(1);
+  });
+  it('ignores conversational replies in one-way mode but still honours legacy opt-outs', async () => {
+    process.env.SMS_CHANNEL_MODE = 'one_way';
+    const reply = { to: '61468104118', from: '61412345678', type: 'inbound', message: 'Interested', received_at: '2026-11-05 10:00:00' };
+    await service.acceptInbound(reply);
+    expect(await store.count('sms_inbound')).toBe(0);
+    expect(await store.count('leads')).toBe(0);
+    await service.acceptInbound({ ...reply, message: 'STOP' });
+    expect(await store.count('suppressions')).toBe(1);
+    expect(await service.claimSmsActivity({ authenticated: true })).toEqual({});
+  });
+  it('does not expose historical conversations or call the inbox provider in one-way mode', async () => {
+    await store.insert('sms_inbound', { id: 'historic', body: 'Historical conversation', receivedAt: '2026-11-04' });
+    process.env.SMS_CHANNEL_MODE = 'one_way';
+    const provider = jest.spyOn(service, 'provider');
+    expect((await service.smsInbox(true)).results).toEqual([]);
+    expect(provider).not.toHaveBeenCalled();
+    expect(await store.count('sms_inbound')).toBe(1);
+  });
+  it('blocks Reply STOP copy and requires public HTTPS URLs for one-way tests', async () => {
+    process.env.SMS_CHANNEL_MODE = 'one_way';
+    await expect(service.createCampaign({ name: 'Invalid copy', body: 'Booran {link} Reply STOP {optout}' })).rejects.toThrow('One-way SMS');
+    for (const url of ['', 'http://localhost:3001', 'https://localhost:3001']) {
+      process.env.PUBLIC_PORTAL_URL = url;
+      expect(service.readiness().publicUrl).toBe(false);
+    }
+    process.env.SMS_TEST_SEND_ENABLED = 'true';
+    process.env.MOBILEMESSAGE_TEST_RECIPIENT = '+61499918523';
+    await expect(service.sendTest({ requestId: randomUUID() })).rejects.toThrow('public HTTPS');
   });
   it('counts tracking visits using atomic increments', async () => {
     const msg = await message();
