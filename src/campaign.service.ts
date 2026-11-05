@@ -47,18 +47,36 @@ export class CampaignService {
   private inboxWorker?: ReturnType<typeof setInterval>;
   private inboxSyncing = false;
   private syncing = false;
+  private dispatchTimer?: ReturnType<typeof setInterval>;
+  private dispatching = false;
+  private readonly runnerId = randomUUID();
   constructor(readonly store: CampaignStore) {}
   async onModuleInit() {
     // Preserve DealerSocket delivery state while staging the second CRM destination.
-    await this.store.updateMany('outbox', { goodshowroomStatus: { $exists: false } }, { $set: {
-      goodshowroomStatus: 'pending_configuration', goodshowroomDetail: 'It will be integrated soon',
-    } });
+    await this.store.updateMany(
+      'outbox',
+      { goodshowroomStatus: { $exists: false } },
+      {
+        $set: {
+          goodshowroomStatus: 'pending_configuration',
+          goodshowroomDetail: 'It will be integrated soon',
+        },
+      },
+    );
     this.worker = setInterval(
       () => void this.syncQueue().catch(() => {}),
       10000,
     );
     this.worker.unref();
-    if (this.channelMode() === 'two_way' && process.env.SMS_INBOX_POLL_ENABLED === 'true') {
+    this.dispatchTimer = setInterval(
+      () => void this.runDispatchOnce().catch(() => {}),
+      3000,
+    );
+    this.dispatchTimer.unref();
+    if (
+      this.channelMode() === 'two_way' &&
+      process.env.SMS_INBOX_POLL_ENABLED === 'true'
+    ) {
       this.inboxWorker = setInterval(() => {
         if (this.inboxSyncing) return;
         this.inboxSyncing = true;
@@ -80,6 +98,255 @@ export class CampaignService {
   onModuleDestroy() {
     if (this.worker) clearInterval(this.worker);
     if (this.inboxWorker) clearInterval(this.inboxWorker);
+    if (this.dispatchTimer) clearInterval(this.dispatchTimer);
+  }
+  async settings() {
+    return JSON.parse((await this.store.setting('campaign-settings')) || '{}');
+  }
+  async publicConfig() {
+    const settings = await this.settings();
+    return {
+      offerName: settings.offerName || '',
+      offerDetails: settings.offerDetails || '',
+      eligibility: settings.eligibility || '',
+      expiresAt: settings.expiresAt || '',
+      active:
+        settings.clientApprovalConfirmed === true &&
+        Date.parse(settings.expiresAt || '') > Date.now(),
+    };
+  }
+  async saveSettings(input: any) {
+    let raw = input.expiresAt;
+    if (typeof raw === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(raw)) {
+      const probe = new Date(`${raw}T12:00:00Z`);
+      if (
+        !Number.isFinite(probe.getTime()) ||
+        probe.toISOString().slice(0, 10) !== raw
+      )
+        throw new BadRequestException('Enter a valid expiry date.');
+      const offset =
+        new Intl.DateTimeFormat('en-AU', {
+          timeZone: 'Australia/Melbourne',
+          timeZoneName: 'shortOffset',
+        })
+          .formatToParts(new Date(`${raw}T12:00:00Z`))
+          .find((p) => p.type === 'timeZoneName')
+          ?.value.replace('GMT', '') || '+11';
+      raw = `${raw}T23:59:59${offset.padEnd(3, '0')}:00`;
+    }
+    const expires = typeof raw === 'string' ? Date.parse(raw) : NaN;
+    if (
+      !text(input.offerName) ||
+      !text(input.offerDetails, 2000) ||
+      !text(input.eligibility, 2000) ||
+      !Number.isFinite(expires) ||
+      expires <= Date.now()
+    )
+      throw new BadRequestException(
+        'Provide the offer, eligibility and a future expiry date.',
+      );
+    const value = {
+      offerName: text(input.offerName),
+      offerDetails: text(input.offerDetails, 2000),
+      eligibility: text(input.eligibility, 2000),
+      expiresAt: new Date(expires).toISOString(),
+      clientApprovalConfirmed: input.clientApprovalConfirmed === true,
+      updatedAt: now(),
+      updatedBy: this.store.currentActor().username,
+    };
+    await this.store.transaction(async () => {
+      await this.store.setSetting('campaign-settings', JSON.stringify(value));
+      await this.store.audit(
+        'Offer configuration updated',
+        `Expiry ${value.expiresAt}; client approval ${value.clientApprovalConfirmed}`,
+      );
+    });
+    return value;
+  }
+  async operations() {
+    return {
+      jobs: await this.store.find('dispatch_jobs', {}, { createdAt: -1 }, 100),
+      messages: await this.store.find(
+        'messages',
+        { status: { $in: ['unknown', 'sending', 'failed'] } },
+        { createdAt: -1 },
+        100,
+      ),
+      crm: await this.store.aggregate('outbox', [
+        {
+          $match: {
+            status: { $in: ['needs_review', 'needs_match', 'writing'] },
+          },
+        },
+        { $limit: 100 },
+        {
+          $lookup: {
+            from: 'leads',
+            localField: 'leadId',
+            foreignField: 'id',
+            as: 'lead',
+          },
+        },
+        { $set: { customer: { $arrayElemAt: ['$lead.firstName', 0] } } },
+        { $project: { _id: 0, lead: 0 } },
+      ]),
+      callbacks: {
+        signingSecretConfigured: Boolean(
+          process.env.MOBILEMESSAGE_WEBHOOK_SECRET,
+        ),
+        lastVerifiedAt:
+          (await this.store.setting('last-verified-sms-callback')) || null,
+      },
+      worker: await this.chromeStatus(),
+    };
+  }
+  async verifyProviderSetup() {
+    const senders = await this.provider('senders'),
+      hooks = await this.provider('webhooks');
+    const clean = (value: unknown) => {
+      try {
+        const u = new URL(String(value));
+        return `${u.origin}${u.pathname}`;
+      } catch {
+        return '';
+      }
+    };
+    const expected = clean(process.env.MOBILEMESSAGE_CALLBACK_URL);
+    return {
+      approvedSender: Boolean(
+        senders.results?.some(
+          (s: any) =>
+            String(s.sender).replace(/^\+/, '') ===
+            String(process.env.MOBILEMESSAGE_FROM || '').replace(/^\+/, ''),
+        ),
+      ),
+      providerSigningSecretConfigured: hooks.has_signing_secret === true,
+      localSigningSecretConfigured: Boolean(
+        process.env.MOBILEMESSAGE_WEBHOOK_SECRET,
+      ),
+      expectedCallback: expected,
+      statusCallback: clean(hooks.webhooks?.status),
+      inboundCallback: clean(hooks.webhooks?.inbound),
+      callbackMatches: Boolean(
+        expected && clean(hooks.webhooks?.status) === expected,
+      ),
+      note: 'Read-only account check. Shared account webhook configuration was not changed.',
+    };
+  }
+  async reconcileMessage(id: string) {
+    const message = await this.store.one('messages', { id });
+    if (!message) throw new BadRequestException('Message not found.');
+    if (!['unknown', 'sending', 'failed'].includes(message.status))
+      throw new ConflictException('This message does not require recovery.');
+    const contact = await this.store.one('contacts', { id: message.contactId });
+    const result = await this.provider(
+      `messages?custom_ref=${encodeURIComponent(id)}`,
+    );
+    const matches = (result.results || []).filter(
+      (r: any) =>
+        r.custom_ref === id &&
+        String(r.to).replace(/^\+/, '') ===
+          String(contact?.mobile || '').replace(/^\+/, '') &&
+        String(r.sender).replace(/^\+/, '') ===
+          String(
+            message.senderId || process.env.MOBILEMESSAGE_FROM || '',
+          ).replace(/^\+/, ''),
+    );
+    if (
+      matches.length !== 1 ||
+      ![
+        'pending',
+        'scheduled',
+        'sent',
+        'delivered',
+        'failed',
+        'cancelled',
+      ].includes(matches[0].status)
+    )
+      return {
+        reconciled: false,
+        message:
+          'No unique provider evidence found. Message remains unchanged; no SMS was retried.',
+      };
+    const provider = matches[0];
+    await this.store.transaction(async () => {
+      await this.store.update(
+        'messages',
+        { id },
+        {
+          $set: {
+            status: ['pending', 'scheduled'].includes(provider.status)
+              ? 'sent'
+              : provider.status === 'cancelled'
+                ? 'failed'
+                : provider.status,
+            providerId: provider.message_id,
+            reconciledAt: now(),
+            reconciledBy: this.store.currentActor().username,
+          },
+        },
+      );
+      await this.store.audit(
+        'SMS provider state reconciled',
+        `${id}; provider status ${provider.status}; no resend`,
+      );
+    });
+    return { reconciled: true, status: provider.status };
+  }
+  async reconcileCrm(leadId: string, input: any) {
+    if (
+      !text(input.evidence, 1000) ||
+      !['confirmed_saved', 'confirmed_not_saved'].includes(input.outcome)
+    )
+      throw new BadRequestException(
+        'Choose the verified outcome and record CRM evidence.',
+      );
+    return this.store.transaction(async () => {
+      const job = await this.store.one('outbox', { leadId });
+      if (!job || job.status !== 'needs_review')
+        throw new ConflictException(
+          'Only a CRM job awaiting review can be reconciled.',
+        );
+      if (
+        input.outcome === 'confirmed_saved' &&
+        !/^[1-9]\d*$/.test(String(input.opportunityId || ''))
+      )
+        throw new BadRequestException('Enter the verified opportunity ID.');
+      const lead = await this.store.one('leads', { id: leadId });
+      await this.store.update(
+        'outbox',
+        { leadId },
+        {
+          $set: {
+            status:
+              input.outcome === 'confirmed_saved'
+                ? 'synced'
+                : 'pending_configuration',
+            detail: `Operator reconciled: ${text(input.evidence, 1000)}`,
+            ...(input.outcome === 'confirmed_saved'
+              ? { opportunityId: String(input.opportunityId) }
+              : {}),
+            reconciliation: {
+              outcome: input.outcome,
+              evidence: text(input.evidence, 1000),
+              by: this.store.currentActor().username,
+              at: now(),
+            },
+            journalResetRequested: input.outcome === 'confirmed_not_saved',
+          },
+        },
+      );
+      if (input.outcome === 'confirmed_saved' && lead?.dealerSocketContactId)
+        await this.store.setSetting(
+          `crm-opportunity:${lead.dealerSocketContactId}`,
+          String(input.opportunityId),
+        );
+      await this.store.audit(
+        'CRM job reconciled',
+        `${leadId}; ${input.outcome}; ${text(input.evidence, 1000)}`,
+      );
+      return { reconciled: true };
+    });
   }
   channelMode(): 'one_way' | 'two_way' {
     return process.env.SMS_CHANNEL_MODE === 'two_way' ? 'two_way' : 'one_way';
@@ -87,12 +354,19 @@ export class CampaignService {
   publicUrlConfigured() {
     try {
       const url = new URL(process.env.PUBLIC_PORTAL_URL || '');
-      return url.protocol === 'https:' && !['localhost', '127.0.0.1', '[::1]'].includes(url.hostname);
-    } catch { return false; }
+      return (
+        url.protocol === 'https:' &&
+        !['localhost', '127.0.0.1', '[::1]'].includes(url.hostname)
+      );
+    } catch {
+      return false;
+    }
   }
   private validateChannelCopy(body: string) {
     if (this.channelMode() === 'one_way' && /reply\s+["']?stop\b/i.test(body))
-      throw new BadRequestException('One-way SMS uses a web opt-out link. Remove Reply STOP from the copy.');
+      throw new BadRequestException(
+        'One-way SMS uses a web opt-out link. Remove Reply STOP from the copy.',
+      );
   }
   private unsubscribeCopy(token: string) {
     return `Opt out: ${process.env.PUBLIC_PORTAL_URL!.replace(/\/$/, '')}/unsubscribe/${token}`;
@@ -224,6 +498,7 @@ export class CampaignService {
       return {
         leadId: lead.id,
         contactId: lead.dealerSocketContactId,
+        journalResetRequested: pending.journalResetRequested === true,
         mobile: lead.mobile,
         email: lead.email,
         salesManager: routing.salesManager,
@@ -256,6 +531,7 @@ export class CampaignService {
         { leadId: id },
         {
           $set: {
+            journalResetRequested: false,
             status: input.state,
             detail,
             ...(input.state === 'synced'
@@ -325,9 +601,12 @@ export class CampaignService {
       storage: 'mongodb',
       smsChannelMode: this.channelMode(),
       enquirySource: 'landing_page',
-      unsubscribeMechanism: this.channelMode() === 'one_way' ? 'web_link' : 'provider_instructions',
+      unsubscribeMechanism:
+        this.channelMode() === 'one_way' ? 'web_link' : 'provider_instructions',
       smsInboxEnabled: this.channelMode() === 'two_way',
-      deliveryCallbacksConfigured: Boolean(process.env.MOBILEMESSAGE_WEBHOOK_SECRET),
+      deliveryCallbacksConfigured: Boolean(
+        process.env.MOBILEMESSAGE_WEBHOOK_SECRET,
+      ),
       provider: Boolean(
         process.env.MOBILEMESSAGE_API_USERNAME &&
         process.env.MOBILEMESSAGE_API_PASSWORD,
@@ -417,7 +696,9 @@ export class CampaignService {
         optOuts: counts[5],
         pending: counts[6],
         pendingDealerSocket: counts[6],
-        pendingGoodshowroom: await this.store.count('outbox', { goodshowroomStatus: { $ne: 'synced' } }),
+        pendingGoodshowroom: await this.store.count('outbox', {
+          goodshowroomStatus: { $ne: 'synced' },
+        }),
       },
       campaigns: await this.store.aggregate('campaigns', [
         { $sort: { createdAt: -1 } },
@@ -472,8 +753,18 @@ export class CampaignService {
           $set: {
             crmStatus: { $arrayElemAt: ['$crm.status', 0] },
             crmDetail: { $arrayElemAt: ['$crm.detail', 0] },
-            goodshowroomStatus: { $ifNull: [{ $arrayElemAt: ['$crm.goodshowroomStatus', 0] }, 'pending_configuration'] },
-            goodshowroomDetail: { $ifNull: [{ $arrayElemAt: ['$crm.goodshowroomDetail', 0] }, 'It will be integrated soon'] },
+            goodshowroomStatus: {
+              $ifNull: [
+                { $arrayElemAt: ['$crm.goodshowroomStatus', 0] },
+                'pending_configuration',
+              ],
+            },
+            goodshowroomDetail: {
+              $ifNull: [
+                { $arrayElemAt: ['$crm.goodshowroomDetail', 0] },
+                'It will be integrated soon',
+              ],
+            },
           },
         },
         { $project: { _id: 0, crm: 0 } },
@@ -485,7 +776,10 @@ export class CampaignService {
         500,
       ),
       activity: await this.store.find('audit', {}, { createdAt: -1 }, 30),
-      readiness: this.readiness(),
+      readiness: {
+        ...this.readiness(),
+        offerApproved: (await this.publicConfig()).active,
+      },
     };
   }
   async importContacts(input: any) {
@@ -620,7 +914,10 @@ export class CampaignService {
     });
   }
   async acceptInbound(input: any) {
-    const configured = String(process.env.MOBILEMESSAGE_FROM || '').replace(/^\+/, '');
+    const configured = String(process.env.MOBILEMESSAGE_FROM || '').replace(
+      /^\+/,
+      '',
+    );
     if (!configured || String(input.to || '').replace(/^\+/, '') !== configured)
       return { accepted: true, ignored: true };
     const mobile = mobileNumber(input.sender || input.from),
@@ -628,7 +925,10 @@ export class CampaignService {
       received = text(input.received_at, 40),
       ref = text(input.original_custom_ref);
     if (this.channelMode() === 'one_way') {
-      if (input.type === 'unsubscribe' || /^(STOP|UNSUBSCRIBE|CANCEL|END|QUIT)$/i.test(body))
+      if (
+        input.type === 'unsubscribe' ||
+        /^(STOP|UNSUBSCRIBE|CANCEL|END|QUIT)$/i.test(body)
+      )
         return this.suppress(mobile, 'Provider opt-out');
       return { accepted: true, ignored: true };
     }
@@ -706,7 +1006,8 @@ export class CampaignService {
   }
   async claimSmsActivity(input: any = {}) {
     if (
-      this.channelMode() !== 'two_way' || input.authenticated !== true ||
+      this.channelMode() !== 'two_way' ||
+      input.authenticated !== true ||
       process.env.DEALERSOCKET_WORKER_MODE !== 'chrome' ||
       process.env.DEALERSOCKET_SMS_ACTIVITY_ENABLED !== 'true'
     )
@@ -837,7 +1138,13 @@ export class CampaignService {
   }
   async smsInbox(sync = false) {
     if (this.channelMode() === 'one_way') {
-      return { results: [], activities: [], tests: await this.store.find('sms_tests', {}, { createdAt: -1 }, 10), truncated: false, channelMode: 'one_way' };
+      return {
+        results: [],
+        activities: [],
+        tests: await this.store.find('sms_tests', {}, { createdAt: -1 }, 10),
+        truncated: false,
+        channelMode: 'one_way',
+      };
     }
     let truncated = false;
     if (sync)
@@ -872,8 +1179,16 @@ export class CampaignService {
       channelMode: this.channelMode(),
       tests: await this.store.find('sms_tests', {}, { createdAt: -1 }, 10),
       messages: await this.store.aggregate('messages', [
-        { $sort: { createdAt: -1 } }, { $limit: 100 },
-        { $lookup: { from: 'contacts', localField: 'contactId', foreignField: 'id', as: 'contact' } },
+        { $sort: { createdAt: -1 } },
+        { $limit: 100 },
+        {
+          $lookup: {
+            from: 'contacts',
+            localField: 'contactId',
+            foreignField: 'id',
+            as: 'contact',
+          },
+        },
         { $set: { mobile: { $arrayElemAt: ['$contact.mobile', 0] } } },
         { $project: { _id: 0, contact: 0, token: 0 } },
       ]),
@@ -890,7 +1205,9 @@ export class CampaignService {
     const previous = await this.store.one('sms_tests', { id });
     if (previous) return previous;
     if (this.channelMode() === 'one_way' && !this.publicUrlConfigured())
-      throw new BadRequestException('Configure the public HTTPS loyalty URL before testing one-way SMS with web opt-out.');
+      throw new BadRequestException(
+        'Configure the public HTTPS loyalty URL before testing one-way SMS with web opt-out.',
+      );
     const senders = await this.provider('senders');
     if (
       !senders.results?.some(
@@ -931,9 +1248,10 @@ export class CampaignService {
             {
               to: recipient.slice(1),
               sender: sender.slice(1),
-              message: this.channelMode() === 'one_way'
-                ? `Booran South Morang Hyundai: Portal connection test only. Please do not reply. ${this.unsubscribeCopy(id)}`
-                : 'Booran South Morang Hyundai: Portal connection test only. No customer campaign has been launched. {optout}',
+              message:
+                this.channelMode() === 'one_way'
+                  ? `Booran South Morang Hyundai: Portal connection test only. Please do not reply. ${this.unsubscribeCopy(id)}`
+                  : 'Booran South Morang Hyundai: Portal connection test only. No customer campaign has been launched. {optout}',
               custom_ref: id,
             },
           ],
@@ -978,6 +1296,285 @@ export class CampaignService {
       throw new BadRequestException(
         'Sending requires configured Mobile Message credentials, registered Sender ID, a public URL, and CAMPAIGN_SEND_ENABLED=true.',
       );
+    if (!(await this.publicConfig()).active)
+      throw new BadRequestException(
+        'Approve the offer and configure a future expiry before sending.',
+      );
+    const jobId = randomUUID();
+    const campaign = await this.store.transaction(async () => {
+      const c = await this.store.one('campaigns', { id });
+      if (!c?.approved)
+        throw new BadRequestException('Approve campaign copy first.');
+      this.validateChannelCopy(c.body);
+      if (c.status !== 'approved')
+        throw new ConflictException('Campaign has already been dispatched.');
+      await this.store.update(
+        'campaigns',
+        { id, status: 'approved' },
+        { $set: { status: 'queued' } },
+      );
+      const suppressed = new Set(
+        (await this.store.find('suppressions')).map((s) => s.mobile),
+      );
+      const contacts = await this.store.find('contacts', {
+        mobile: { $nin: [...suppressed] },
+      });
+      if (!contacts.length)
+        throw new BadRequestException(
+          'Upload a consented audience with eligible recipients before dispatch.',
+        );
+      await this.store.insertMany(
+        'messages',
+        contacts.map((contact) => ({
+          id: randomUUID(),
+          campaignId: id,
+          contactId: contact.id,
+          token: randomUUID(),
+          dispatchJobId: jobId,
+          senderId: ready.senderId,
+          status: 'queued',
+          providerId: null,
+          clicks: 0,
+          createdAt: now(),
+        })),
+      );
+      await this.store.insert('dispatch_jobs', {
+        id: jobId,
+        campaignId: id,
+        status: 'queued',
+        createdAt: now(),
+        requestedBy: this.store.currentActor(),
+        sent: 0,
+        uncertain: 0,
+        remaining: contacts.length,
+      });
+      await this.store.audit('Campaign dispatch queued', id);
+      return c;
+    });
+    return { accepted: true, jobId, campaignId: campaign.id, status: 'queued' };
+  }
+  private async continueDispatch(jobId: string, owner: string) {
+    const job = await this.store.one('dispatch_jobs', {
+      id: jobId,
+      owner,
+      status: 'running',
+      leaseUntil: { $gt: new Date() },
+    });
+    if (
+      !job ||
+      job.pauseRequested ||
+      process.env.CAMPAIGN_SEND_ENABLED !== 'true'
+    )
+      return false;
+    if (!(await this.publicConfig()).active) return false;
+    const result = await this.store.update(
+      'dispatch_jobs',
+      { id: jobId, owner, status: 'running' },
+      {
+        $set: { heartbeatAt: now(), leaseUntil: new Date(Date.now() + 90000) },
+      },
+    );
+    return result.matchedCount === 1;
+  }
+  async runDispatchOnce() {
+    if (this.dispatching || process.env.CAMPAIGN_SEND_ENABLED !== 'true')
+      return;
+    this.dispatching = true;
+    let claimed: any;
+    try {
+      claimed = await this.store.transaction(async () => {
+        const job = await this.store.one(
+          'dispatch_jobs',
+          {
+            $or: [
+              { status: 'queued' },
+              { status: 'running', leaseUntil: { $lt: new Date() } },
+            ],
+          },
+          { createdAt: 1 },
+        );
+        if (!job) return null;
+        if (job.status === 'running')
+          await this.store.updateMany(
+            'messages',
+            { dispatchJobId: job.id, status: 'sending' },
+            {
+              $set: {
+                status: 'unknown',
+                recoveryReason:
+                  'Worker lease expired during a provider attempt; reconcile before any resend.',
+              },
+            },
+          );
+        await this.store.update(
+          'dispatch_jobs',
+          { id: job.id },
+          {
+            $set: {
+              status: 'running',
+              owner: this.runnerId,
+              heartbeatAt: now(),
+              leaseUntil: new Date(Date.now() + 90000),
+            },
+          },
+        );
+        await this.store.update(
+          'campaigns',
+          { id: job.campaignId },
+          { $set: { status: 'sending' } },
+        );
+        return job;
+      });
+      if (!claimed) return;
+      let error = '';
+      try {
+        await this.store.asActor(
+          claimed.requestedBy || {
+            id: 'system',
+            username: 'dispatch-worker',
+            role: 'system',
+          },
+          () =>
+            this.dispatchCampaign(
+              claimed.campaignId,
+              claimed.id,
+              this.runnerId,
+            ),
+        );
+      } catch (failure) {
+        error =
+          failure instanceof Error
+            ? failure.message.slice(0, 200)
+            : 'Dispatch requires review.';
+      }
+      await this.store.transaction(async () => {
+        const current = await this.store.one('dispatch_jobs', {
+          id: claimed.id,
+          owner: this.runnerId,
+          status: 'running',
+        });
+        if (!current) return;
+        const sent = await this.store.count('messages', {
+          campaignId: claimed.campaignId,
+          status: { $in: ['sent', 'delivered'] },
+        });
+        const uncertain = await this.store.count('messages', {
+          campaignId: claimed.campaignId,
+          status: { $in: ['unknown', 'sending'] },
+        });
+        const remaining = await this.store.count('messages', {
+          campaignId: claimed.campaignId,
+          status: 'queued',
+        });
+        const status = remaining
+          ? 'paused'
+          : uncertain
+            ? 'needs_review'
+            : 'completed';
+        await this.store.update(
+          'dispatch_jobs',
+          { id: claimed.id, owner: this.runnerId },
+          {
+            $set: {
+              status,
+              sent,
+              uncertain,
+              remaining,
+              lastError: error,
+              finishedAt: now(),
+            },
+            $unset: { leaseUntil: '', owner: '' },
+          },
+        );
+        await this.store.update(
+          'campaigns',
+          { id: claimed.campaignId },
+          { $set: { status } },
+        );
+        await this.store.audit(
+          'Dispatch worker stopped',
+          `${claimed.campaignId}; ${status}; ${sent} accepted; ${uncertain} uncertain; ${remaining} queued`,
+        );
+      });
+    } finally {
+      this.dispatching = false;
+    }
+  }
+  async controlDispatch(campaignId: string, action: 'pause' | 'resume') {
+    return this.store.transaction(async () => {
+      const job = await this.store.one('dispatch_jobs', { campaignId });
+      if (!job) throw new BadRequestException('Dispatch job not found.');
+      if (action === 'pause') {
+        if (!['queued', 'running'].includes(job.status))
+          throw new ConflictException(
+            'Only queued or running dispatch can be paused.',
+          );
+        await this.store.update(
+          'dispatch_jobs',
+          { id: job.id },
+          {
+            $set: {
+              pauseRequested: true,
+              ...(job.status === 'queued' ? { status: 'paused' } : {}),
+            },
+          },
+        );
+        if (job.status === 'queued')
+          await this.store.update(
+            'campaigns',
+            { id: campaignId },
+            { $set: { status: 'paused' } },
+          );
+      } else {
+        if (!['paused', 'needs_review'].includes(job.status))
+          throw new ConflictException(
+            'Only paused or reviewed jobs can resume.',
+          );
+        if (
+          !(await this.store.count('messages', {
+            campaignId,
+            status: 'queued',
+          }))
+        )
+          throw new ConflictException(
+            'No unsent queued recipients remain. Uncertain messages are never resent automatically.',
+          );
+        await this.store.update(
+          'dispatch_jobs',
+          { id: job.id },
+          {
+            $set: { status: 'queued', pauseRequested: false },
+            $unset: { leaseUntil: '', owner: '' },
+          },
+        );
+        await this.store.update(
+          'campaigns',
+          { id: campaignId },
+          { $set: { status: 'queued' } },
+        );
+      }
+      await this.store.audit(
+        'Dispatch control',
+        `${campaignId}; ${action}; only queued recipients may resume`,
+      );
+      return { accepted: true };
+    });
+  }
+  private async dispatchCampaign(id: string, jobId: string, owner: string) {
+    const ready = this.readiness();
+    if (!(await this.publicConfig()).active)
+      throw new BadRequestException(
+        'Approve the offer and configure a future expiry before sending.',
+      );
+    if (
+      !ready.provider ||
+      !ready.sendingEnabled ||
+      !ready.senderRegistered ||
+      !ready.publicUrl
+    )
+      throw new BadRequestException(
+        'Sending requires configured Mobile Message credentials, registered Sender ID, a public URL, and CAMPAIGN_SEND_ENABLED=true.',
+      );
     const senders = await this.provider('senders');
     if (
       !senders.results?.some(
@@ -989,45 +1586,40 @@ export class CampaignService {
       throw new BadRequestException(
         'The configured sender is not approved on the Mobile Message account.',
       );
-    const campaign = await this.store.transaction(async () => {
-      const c = await this.store.one('campaigns', { id });
-      if (!c?.approved)
-        throw new BadRequestException('Approve campaign copy first.');
-      this.validateChannelCopy(c.body);
-      if (c.status !== 'approved')
-        throw new ConflictException('Campaign has already been dispatched.');
-      await this.store.update(
-        'campaigns',
-        { id, status: 'approved' },
-        { $set: { status: 'sending' } },
-      );
-      const suppressed = new Set(
-        (await this.store.find('suppressions')).map((s) => s.mobile),
-      );
-      const contacts = await this.store.find('contacts', {
-        mobile: { $nin: [...suppressed] },
-      });
-      await this.store.insertMany(
-        'messages',
-        contacts.map((contact) => ({
-          id: randomUUID(),
-          campaignId: id,
-          contactId: contact.id,
-          token: randomUUID(),
-          status: 'queued',
-          providerId: null,
-          clicks: 0,
-          createdAt: now(),
-        })),
-      );
-      return c;
-    });
+    const campaign = await this.store.one('campaigns', { id });
+    if (!campaign) throw new BadRequestException('Campaign not found.');
+    this.validateChannelCopy(campaign.body);
     let sent = 0,
       uncertain = 0;
+    let processed = 0;
     for (const queued of await this.store.find('messages', {
       campaignId: id,
       status: 'queued',
     })) {
+      if (!(await this.continueDispatch(jobId, owner))) break;
+      if (++processed % 25 === 0) {
+        const remaining = await this.store.count('messages', {
+          campaignId: id,
+          status: 'queued',
+        });
+        await this.store.update(
+          'dispatch_jobs',
+          { id: jobId, owner, status: 'running' },
+          {
+            $set: {
+              sent: await this.store.count('messages', {
+                campaignId: id,
+                status: { $in: ['sent', 'delivered'] },
+              }),
+              uncertain: await this.store.count('messages', {
+                campaignId: id,
+                status: 'unknown',
+              }),
+              remaining,
+            },
+          },
+        );
+      }
       const contact = await this.store.one('contacts', {
         id: queued.contactId,
       });
@@ -1068,7 +1660,9 @@ export class CampaignService {
         await this.store.update(
           'messages',
           { id: queued.id, status: 'queued' },
-          { $set: { status: 'sending' } },
+          {
+            $set: { status: 'sending', dispatchJobId: jobId, claimedAt: now() },
+          },
         );
         return true;
       });
@@ -1086,7 +1680,12 @@ export class CampaignService {
         body = campaign.body
           .replaceAll('{link}', url)
           .replaceAll('{firstName}', contact.firstName || 'there')
-          .replaceAll('{optout}', this.channelMode() === 'one_way' ? this.unsubscribeCopy(queued.token) : '{optout}');
+          .replaceAll(
+            '{optout}',
+            this.channelMode() === 'one_way'
+              ? this.unsubscribeCopy(queued.token)
+              : '{optout}',
+          );
       let result: any;
       try {
         const data = await this.provider(
@@ -1139,7 +1738,11 @@ export class CampaignService {
         );
         if (result.status === 'blocked')
           await this.suppress(contact.mobile, 'Provider opt-out');
-        if (status === 'sent' && this.channelMode() === 'two_way' && process.env.DEALERSOCKET_SMS_ACTIVITY_ENABLED === 'true')
+        if (
+          status === 'sent' &&
+          this.channelMode() === 'two_way' &&
+          process.env.DEALERSOCKET_SMS_ACTIVITY_ENABLED === 'true'
+        )
           await this.queueSmsActivity(
             `outbound:${queued.id}`,
             contact.mobile,
@@ -1150,18 +1753,16 @@ export class CampaignService {
       });
       if (status === 'sent') sent++;
     }
-    await this.store.update(
-      'campaigns',
-      { id },
-      { $set: { status: uncertain ? 'needs_review' : 'completed' } },
-    );
-    await this.store.audit(
-      'Campaign send finished',
-      `${sent} accepted; ${uncertain} require provider reconciliation`,
-    );
     return { sent, uncertain };
   }
   async captureLead(input: any) {
+    if (
+      input.requireActiveOffer === true &&
+      !(await this.publicConfig()).active
+    )
+      throw new BadRequestException(
+        'This offer is not active. Please contact the dealership.',
+      );
     const mobile = mobileNumber(input.mobile),
       eventId = text(input.eventId, 100);
     if (!eventId || !text(input.firstName))
@@ -1319,10 +1920,13 @@ export class CampaignService {
     return message;
   }
   private async unsubscribeMobile(token: string) {
-    if (!/^[a-f0-9-]{36}$/i.test(token)) throw new BadRequestException('Invalid unsubscribe link.');
+    if (!/^[a-f0-9-]{36}$/i.test(token))
+      throw new BadRequestException('Invalid unsubscribe link.');
     const message = await this.store.one('messages', { token });
     if (message) {
-      const contact = await this.store.one('contacts', { id: message.contactId });
+      const contact = await this.store.one('contacts', {
+        id: message.contactId,
+      });
       if (contact?.mobile) return String(contact.mobile);
     }
     const test = await this.store.one('sms_tests', { id: token });
@@ -1331,7 +1935,13 @@ export class CampaignService {
   }
   async unsubscribeStatus(token: string) {
     const mobile = await this.unsubscribeMobile(token);
-    return { valid: true, maskedMobile: `•••• ${mobile.slice(-4)}`, alreadySuppressed: Boolean(await this.store.one('suppressions', { mobile })) };
+    return {
+      valid: true,
+      maskedMobile: `•••• ${mobile.slice(-4)}`,
+      alreadySuppressed: Boolean(
+        await this.store.one('suppressions', { mobile }),
+      ),
+    };
   }
   async unsubscribe(token: string) {
     const mobile = await this.unsubscribeMobile(token);

@@ -24,6 +24,9 @@ export const COLLECTIONS = [
   'sms_tests',
   'sms_inbound',
   'sms_activity',
+  'users',
+  'sessions',
+  'dispatch_jobs',
 ] as const;
 export type CollectionName = (typeof COLLECTIONS)[number];
 
@@ -84,6 +87,9 @@ export class CampaignStore implements OnModuleInit, OnModuleDestroy {
       ['outbox', { leadId: 1 }],
       ['receipts', { messageId: 1, part: 1 }],
       ['sms_activity', { sourceRef: 1 }],
+      ['users', { username: 1 }],
+      ['sessions', { tokenHash: 1 }],
+      ['dispatch_jobs', { campaignId: 1 }],
     ] as [string, Record<string, 1>][])
       await this.db.collection(name).createIndex(keys, { unique: true });
     for (const name of ['outbox', 'sms_activity', 'messages', 'sms_tests'])
@@ -96,6 +102,15 @@ export class CampaignStore implements OnModuleInit, OnModuleDestroy {
     await this.db.collection('sms_inbound').createIndex({ receivedAt: -1 });
     await this.db.collection('audit').createIndex({ createdAt: -1 });
     await this.db
+      .collection('sessions')
+      .createIndex({ expiresAt: 1 }, { expireAfterSeconds: 0 });
+    await this.db
+      .collection('settings')
+      .createIndex({ expiresAt: 1 }, { expireAfterSeconds: 0 });
+    await this.db
+      .collection('dispatch_jobs')
+      .createIndex({ status: 1, leaseUntil: 1 });
+    await this.db
       .collection('_locks')
       .updateOne(
         { _id: 'campaign-operations' as any },
@@ -106,14 +121,32 @@ export class CampaignStore implements OnModuleInit, OnModuleDestroy {
   private get options() {
     return { session: this.context.getStore() };
   }
+  private readonly actor = new AsyncLocalStorage<{
+    id: string;
+    username: string;
+    role: string;
+  }>();
+  asActor<T>(
+    actor: { id: string; username: string; role: string },
+    fn: () => T,
+  ) {
+    return this.actor.run(actor, fn);
+  }
+  currentActor() {
+    return (
+      this.actor.getStore() || {
+        id: 'system',
+        username: 'system',
+        role: 'system',
+      }
+    );
+  }
   one(name: CollectionName, filter: Filter<Document> = {}, sort?: Sort) {
-    return this.db
-      .collection(name)
-      .findOne(filter, {
-        ...this.options,
-        projection: { _id: 0 },
-        ...(sort ? { sort } : {}),
-      });
+    return this.db.collection(name).findOne(filter, {
+      ...this.options,
+      projection: { _id: 0 },
+      ...(sort ? { sort } : {}),
+    });
   }
   find(
     name: CollectionName,
@@ -204,6 +237,8 @@ export class CampaignStore implements OnModuleInit, OnModuleDestroy {
       id: randomUUID(),
       action,
       detail,
+      actorId: this.currentActor().id,
+      actorName: this.currentActor().username,
       createdAt: new Date().toISOString(),
     });
   }

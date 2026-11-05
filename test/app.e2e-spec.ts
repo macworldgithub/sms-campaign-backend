@@ -8,12 +8,15 @@ import { testStore, closeTestStore } from '../src/testing/mongo';
 jest.setTimeout(60000);
 describe('MongoDB HTTP integration', () => {
   let app: INestApplication, store: CampaignStore;
+  let token = '';
   const old = { ...process.env };
   const key = 'isolated-http-test-key-000000000000000000';
   beforeAll(async () => {
     store = await testStore();
     Object.assign(process.env, {
       PORTAL_API_KEY: key,
+      PORTAL_BOOTSTRAP_USERNAME: 'admin',
+      PORTAL_BOOTSTRAP_PASSWORD: 'Test administrator password 123',
       LEAD_WEBHOOK_KEY: key,
       SMS_INBOX_POLL_ENABLED: 'false',
       DEALERSOCKET_CAMPAIGN_WRITES_ENABLED: 'false',
@@ -27,6 +30,12 @@ describe('MongoDB HTTP integration', () => {
     app = module.createNestApplication({ rawBody: true });
     app.setGlobalPrefix('api');
     await app.init();
+    const auth = await request(app.getHttpServer())
+      .post('/api/auth/login')
+      .set({ 'X-Portal-Key': key })
+      .send({ username: 'admin', password: 'Test administrator password 123' })
+      .expect(201);
+    token = auth.body.token;
   });
   afterAll(async () => {
     if (store) await closeTestStore(store);
@@ -67,6 +76,7 @@ describe('MongoDB HTTP integration', () => {
     const portal = await request(app.getHttpServer())
       .get('/api/portal')
       .set('X-Portal-Key', key)
+      .set('Authorization', 'Bearer ' + token)
       .expect(200);
     expect(portal.body.metrics).toMatchObject({
       leads: 1,
@@ -74,5 +84,91 @@ describe('MongoDB HTTP integration', () => {
       pending: 1,
     });
     expect(portal.body.leads[0].crmStatus).toBe('pending_configuration');
+  });
+  it('enforces staff roles over HTTP and revokes disabled accounts', async () => {
+    const admin = { 'X-Portal-Key': key, Authorization: 'Bearer ' + token };
+    await request(app.getHttpServer())
+      .post('/api/users')
+      .set(admin)
+      .send({
+        username: 'http.viewer',
+        name: 'HTTP Viewer',
+        role: 'viewer',
+        active: true,
+        password: 'Viewer temporary password 123',
+      })
+      .expect(201);
+    const login = await request(app.getHttpServer())
+      .post('/api/auth/login')
+      .set('X-Portal-Key', key)
+      .send({
+        username: 'http.viewer',
+        password: 'Viewer temporary password 123',
+      })
+      .expect(201);
+    const viewer = {
+      'X-Portal-Key': key,
+      Authorization: 'Bearer ' + login.body.token,
+    };
+    await request(app.getHttpServer())
+      .get('/api/portal')
+      .set(viewer)
+      .expect(403);
+    await request(app.getHttpServer())
+      .post('/api/auth/password')
+      .set(viewer)
+      .send({
+        currentPassword: 'Viewer temporary password 123',
+        newPassword: 'Viewer permanent password 456',
+      })
+      .expect(201);
+    const next = await request(app.getHttpServer())
+      .post('/api/auth/login')
+      .set('X-Portal-Key', key)
+      .send({
+        username: 'http.viewer',
+        password: 'Viewer permanent password 456',
+      })
+      .expect(201);
+    viewer.Authorization = 'Bearer ' + next.body.token;
+    await request(app.getHttpServer())
+      .get('/api/portal')
+      .set(viewer)
+      .expect(200);
+    await request(app.getHttpServer())
+      .post('/api/settings')
+      .set(viewer)
+      .send({})
+      .expect(403);
+    await request(app.getHttpServer())
+      .post('/api/users')
+      .set(admin)
+      .send({
+        username: 'http.viewer',
+        name: 'HTTP Viewer',
+        role: 'viewer',
+        active: false,
+      })
+      .expect(201);
+    await request(app.getHttpServer())
+      .get('/api/portal')
+      .set(viewer)
+      .expect(401);
+  });
+  it('rejects a public registration when the offer has not been approved', async () => {
+    const config = await request(app.getHttpServer())
+      .get('/api/public/config')
+      .expect(200);
+    expect(config.body.active).toBe(false);
+    await request(app.getHttpServer())
+      .post('/api/webhooks/leads')
+      .set('X-Webhook-Key', key)
+      .send({
+        firstName: 'Expired',
+        mobile: '0412345679',
+        requireActiveOffer: true,
+      })
+      .expect(400);
+    expect(await store.count('leads', { mobile: '+61412345679' })).toBe(0);
   });
 });

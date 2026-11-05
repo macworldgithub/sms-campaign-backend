@@ -19,6 +19,7 @@ describe('MongoDB campaign controls', () => {
   });
   beforeEach(async () => {
     service = new CampaignService(store);
+    await service.saveSettings({ offerName: 'Test offer', offerDetails: 'Fixture only', eligibility: 'Consented test audience', expiresAt: new Date(Date.now() + 30 * 86400000).toISOString(), clientApprovalConfirmed: true });
     process.env.CAMPAIGN_SEND_ENABLED = 'false';
     process.env.SMS_CHANNEL_MODE = 'two_way';
     process.env.DEALERSOCKET_SMS_ACTIVITY_ENABLED = 'true';
@@ -45,6 +46,12 @@ describe('MongoDB campaign controls', () => {
   afterAll(async () => {
     if (store) await closeTestStore(store);
   });
+  async function dispatch(id: string) {
+    await service.send(id);
+    await service.runDispatchOnce();
+    const job = await store.one('dispatch_jobs', { campaignId: id });
+    return { sent: Number(job?.sent || 0), uncertain: Number(job?.uncertain || 0) };
+  }
   async function message() {
     await service.importContacts({ rows: [row] });
     const contact = (await store.one('contacts', { mobile: '+61412345678' }))!;
@@ -293,7 +300,7 @@ describe('MongoDB campaign controls', () => {
       body: 'Booran {link} {optout}',
     });
     await service.approve(c.id);
-    await expect(service.send(c.id)).rejects.toThrow();
+    await expect(dispatch(c.id)).rejects.toThrow();
   });
   it('sends an approved campaign once with concurrent dispatches', async () => {
     Object.assign(process.env, {
@@ -317,8 +324,8 @@ describe('MongoDB campaign controls', () => {
           : { results: [{ status: 'success', message_id: 'mock-sent' }] },
       );
     const results = await Promise.allSettled([
-      service.send(c.id),
-      service.send(c.id),
+      dispatch(c.id),
+      dispatch(c.id),
     ]);
     expect(results.filter((r) => r.status === 'fulfilled')).toHaveLength(1);
     expect(provider.mock.calls.filter((c) => c[0] === 'messages')).toHaveLength(
@@ -345,8 +352,8 @@ describe('MongoDB campaign controls', () => {
       if (path === 'senders') return { results: [{ sender: '61468104118' }] };
       throw new Error('timeout');
     });
-    expect((await service.send(c.id)).uncertain).toBe(1);
-    await expect(service.send(c.id)).rejects.toThrow();
+    expect((await dispatch(c.id)).uncertain).toBe(1);
+    await expect(dispatch(c.id)).rejects.toThrow();
     expect(await store.count('messages', { status: 'unknown' })).toBe(1);
   });
   it('enforces the frequency limit across separate campaigns', async () => {
@@ -355,7 +362,7 @@ describe('MongoDB campaign controls', () => {
     const provider = jest.spyOn(service, 'provider').mockImplementation(async path => path === 'senders' ? { results: [{ sender: '61468104118' }] } : { results: [{ status: 'success', message_id: 'mock-frequency' }] });
     for (const name of ['First', 'Second']) {
       const campaign = await service.createCampaign({ name, body: 'Booran {link} {optout}' });
-      await service.approve(campaign.id); await service.send(campaign.id);
+      await service.approve(campaign.id); await dispatch(campaign.id);
     }
     expect(provider.mock.calls.filter(c => c[0] === 'messages')).toHaveLength(1);
     expect(await store.count('messages', { status: 'frequency_limited' })).toBe(1);
@@ -386,7 +393,7 @@ describe('MongoDB campaign controls', () => {
     const campaign = await service.createCampaign({ name: 'One-way invitation', body: 'Booran loyalty offer {link} {optout}' });
     await service.approve(campaign.id);
     const provider = jest.spyOn(service, 'provider').mockImplementation(async path => path === 'senders' ? { results: [{ sender: '61468104118' }] } : { results: [{ status: 'success', message_id: 'one-way-fixture' }] });
-    await service.send(campaign.id);
+    await dispatch(campaign.id);
     const msg = (await store.one('messages', { campaignId: campaign.id }))!;
     const payload = provider.mock.calls.find(c => c[0] === 'messages')![2] as any;
     expect(payload.messages[0].message).toContain(`/r/${msg.token}`);

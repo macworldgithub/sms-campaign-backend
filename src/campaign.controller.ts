@@ -636,6 +636,10 @@ export class CampaignController {
       .digest('hex');
     if (!timingSafeEqual(Buffer.from(expected), Buffer.from(signature)))
       throw new UnauthorizedException('Invalid webhook signature.');
+    await this.service.store.setSetting(
+      'last-verified-sms-callback',
+      new Date().toISOString(),
+    );
     if (
       ['inbound', 'unsubscribe'].includes(input.type || '') &&
       (input as any).to

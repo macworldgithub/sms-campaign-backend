@@ -10,6 +10,7 @@ async function bootstrap() {
   });
   app.useBodyParser('json', { limit: '8mb' });
   app.setGlobalPrefix('api');
+  app.enableShutdownHooks();
 
   // Complete Swagger / OpenAPI Configuration
   const config = new DocumentBuilder()
