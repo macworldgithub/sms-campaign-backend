@@ -53,7 +53,21 @@ export class CampaignStore implements OnModuleInit, OnModuleDestroy {
       writeConcern: { w: 'majority' },
     });
     await this.client.connect();
-    this.db = this.client.db(process.env.MONGODB_DB_NAME || 'sms_campaign');
+    const configuredDb = process.env.MONGODB_DB_NAME || undefined;
+    this.db = this.client.db(configuredDb);
+    if (this.db.databaseName === 'sms-campaign') {
+      try {
+        const dbs = await this.client.db().admin().listDatabases();
+        if (
+          !dbs.databases.some((d) => d.name === 'sms-campaign') &&
+          dbs.databases.some((d) => d.name === 'sms_campaign')
+        ) {
+          this.db = this.client.db('sms_campaign');
+        }
+      } catch {
+        // Continue if admin list is not permitted
+      }
+    }
     for (const name of COLLECTIONS) {
       if (!(await this.db.listCollections({ name }).hasNext()))
         await this.db.createCollection(name);
