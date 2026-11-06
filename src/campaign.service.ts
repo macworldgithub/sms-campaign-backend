@@ -116,6 +116,9 @@ export class CampaignService {
     };
   }
   async saveSettings(input: any) {
+    if (!text(input.offerName)) throw new BadRequestException('Enter an offer name.');
+    if (!text(input.offerDetails, 2000)) throw new BadRequestException('Enter the approved offer details.');
+    if (!text(input.eligibility, 2000)) throw new BadRequestException('Enter the customer eligibility requirements.');
     let raw = input.expiresAt;
     if (typeof raw === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(raw)) {
       const probe = new Date(`${raw}T12:00:00Z`);
@@ -135,16 +138,11 @@ export class CampaignService {
       raw = `${raw}T23:59:59${offset.padEnd(3, '0')}:00`;
     }
     const expires = typeof raw === 'string' ? Date.parse(raw) : NaN;
-    if (
-      !text(input.offerName) ||
-      !text(input.offerDetails, 2000) ||
-      !text(input.eligibility, 2000) ||
-      !Number.isFinite(expires) ||
-      expires <= Date.now()
-    )
-      throw new BadRequestException(
-        'Provide the offer, eligibility and a future expiry date.',
-      );
+    if (!Number.isFinite(expires)) throw new BadRequestException('Enter a valid expiry date using the calendar.');
+    if (expires <= Date.now()) {
+      const selected = new Intl.DateTimeFormat('en-AU', { timeZone: 'Australia/Melbourne', day: 'numeric', month: 'long', year: 'numeric' }).format(new Date(expires));
+      throw new BadRequestException(`The expiry date (${selected}, Melbourne time) has already passed. Choose today or a later date using the calendar; your browser may display month/day/year.`);
+    }
     const value = {
       offerName: text(input.offerName),
       offerDetails: text(input.offerDetails, 2000),

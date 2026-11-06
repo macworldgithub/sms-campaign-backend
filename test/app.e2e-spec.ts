@@ -171,4 +171,21 @@ describe('MongoDB HTTP integration', () => {
       .expect(400);
     expect(await store.count('leads', { mobile: '+61412345679' })).toBe(0);
   });
+  it('opens the main-page customer view from campaign links and preserves attribution', async () => {
+    const previous = process.env.PUBLIC_PORTAL_URL;
+    process.env.PUBLIC_PORTAL_URL = 'https://loyalty.example.test';
+    try {
+      await store.insert('contacts', { id: 'tracking-contact', mobile: '+61412345679' });
+      await store.insert('messages', { id: 'tracking-message', contactId: 'tracking-contact', campaignId: 'tracking-campaign', token: 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee', clicks: 0 });
+      const result = await request(app.getHttpServer()).get('/api/tracking/aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee').expect(302);
+      const target = new URL(result.headers.location);
+      expect(target.pathname).toBe('/');
+      expect(target.searchParams.get('view')).toBe('customer');
+      expect(target.searchParams.get('ref')).toBe('aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee');
+      expect(target.searchParams.get('utm_campaign')).toBe('tracking-campaign');
+    } finally {
+      if (previous === undefined) delete process.env.PUBLIC_PORTAL_URL;
+      else process.env.PUBLIC_PORTAL_URL = previous;
+    }
+  });
 });

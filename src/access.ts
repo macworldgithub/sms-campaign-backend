@@ -19,7 +19,8 @@ export class AccessGuard implements CanActivate {
     const req = context.switchToHttp().getRequest();
     const path = String(req.path)
       .replace(/^\/api\/?/, '')
-      .replace(/^\//, '');
+      .replace(/^\//, '')
+      .replace(/\/$/, '');
     if (
       !path ||
       path === 'health' ||
@@ -44,7 +45,7 @@ export class AccessGuard implements CanActivate {
       };
       return true;
     }
-    if (path === 'auth/login') return true;
+    if (path === 'auth/login' && req.method === 'POST') return true;
     const token = String(req.headers.authorization || '').replace(
       /^Bearer /,
       '',
@@ -74,7 +75,34 @@ export class AccessGuard implements CanActivate {
       user.role === 'viewer'
     )
       throw new ForbiddenException('Your account has read-only access.');
-    return true;
+    const readable =
+      /^(portal|routing|settings|operations|dealersocket|provider|sms\/(outbound|inbox))$/.test(
+        path,
+      );
+    const authRoute =
+      (req.method === 'GET' && path === 'auth/me') ||
+      (req.method === 'POST' &&
+        ['auth/logout', 'auth/password'].includes(path));
+    const manageable =
+      /^(contacts\/import(?:-workbook)?|suppressions|campaigns(?:\/[^/]+\/(approve|send|pause|resume))?|leads\/[^/]+\/customer|sms\/(test|inbox\/sync|activity\/[^/]+\/customer)|operations\/(messages|crm)\/[^/]+|dealersocket\/(check|login|sync))$/.test(
+        path,
+      );
+    const adminRoute =
+      path === 'users' ||
+      path === 'operations/provider' ||
+      (req.method === 'POST' && ['settings', 'routing'].includes(path));
+    if (
+      authRoute ||
+      (req.method === 'GET' && readable) ||
+      (user.role === 'admin' &&
+        adminRoute &&
+        ['GET', 'POST'].includes(req.method)) ||
+      (req.method === 'POST' &&
+        manageable &&
+        ['admin', 'campaign_manager'].includes(user.role))
+    )
+      return true;
+    throw new ForbiddenException('Your role does not permit this operation.');
   }
 }
 

@@ -247,4 +247,14 @@ describe('Durable dispatch and recovery', () => {
     expect(summer.expiresAt).toBe(`${futureYear}-01-15T12:59:59.000Z`);
     expect(winter.expiresAt).toBe(`${futureYear}-07-15T13:59:59.000Z`);
   });
+  it('explains an expired US-format selection while accepting today until Melbourne midnight', async () => {
+    jest.spyOn(Date, 'now').mockReturnValue(Date.parse('2026-11-06T12:00:00Z'));
+    const input = { offerName: 'Fixture', offerDetails: 'Fixture', eligibility: 'Fixture', clientApprovalConfirmed: true };
+    await expect(service.saveSettings({ ...input, expiresAt: '2026-06-11' })).rejects.toThrow('11 June 2026');
+    const today = await service.saveSettings({ ...input, expiresAt: '2026-11-06' });
+    expect(today.expiresAt).toBe('2026-11-06T12:59:59.000Z');
+    jest.spyOn(Date, 'now').mockReturnValue(Date.parse('2026-11-06T13:00:00Z'));
+    await expect(service.saveSettings({ ...input, expiresAt: '2026-11-06' })).rejects.toThrow('already passed');
+    await expect(service.saveSettings({ ...input, expiresAt: '2026-02-30' })).rejects.toThrow('valid expiry');
+  });
 });

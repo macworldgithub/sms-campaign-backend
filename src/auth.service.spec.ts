@@ -182,4 +182,95 @@ describe('Individual staff access', () => {
       (await store.one('audit', { action: 'Fixture action' }))?.actorName,
     ).toBe('admin');
   });
+  it('never restores the bootstrap password after a password change or restart', async () => {
+    const login = await auth.login({
+      username: 'admin',
+      password: 'Test administrator password 123',
+    });
+    await auth.changePassword(login.user, {
+      currentPassword: 'Test administrator password 123',
+      newPassword: 'Changed administrator password 456',
+    });
+    await expect(auth.authenticate(login.token)).rejects.toThrow();
+    await expect(
+      auth.login({
+        username: 'admin',
+        password: 'Test administrator password 123',
+      }),
+    ).rejects.toThrow('Invalid');
+    await new AuthService(store).onModuleInit();
+    await expect(
+      auth.login({
+        username: 'admin',
+        password: 'Test administrator password 123',
+      }),
+    ).rejects.toThrow('Invalid');
+    expect(
+      (
+        await auth.login({
+          username: 'admin',
+          password: 'Changed administrator password 456',
+        })
+      ).user.role,
+    ).toBe('admin');
+  });
+  it('requires individual usernames, strong new passwords and explicit route permission', async () => {
+    await expect(
+      auth.login({ password: 'Test administrator password 123' }),
+    ).rejects.toThrow('Invalid');
+    const login = await auth.login({
+      username: 'admin',
+      password: 'Test administrator password 123',
+    });
+    await expect(
+      auth.changePassword(login.user, {
+        currentPassword: 'Test administrator password 123',
+        newPassword: '123456',
+      }),
+    ).rejects.toThrow('12');
+    const guard = new AccessGuard(auth);
+    await expect(
+      guard.canActivate(
+        context('new-unapproved-operation', 'POST', login.token),
+      ),
+    ).rejects.toThrow('role');
+    await expect(
+      guard.canActivate(context('auth/unknown', 'POST', login.token)),
+    ).rejects.toThrow('role');
+  });
+  it.each(['viewer', 'campaign_manager', 'admin'])(
+    'enforces the %s permission matrix',
+    async (role) => {
+      const login = await staff(role);
+      await store.update(
+        'users',
+        { id: login.user.id },
+        { $set: { mustChangePassword: false } },
+      );
+      const guard = new AccessGuard(auth);
+      const matrix = [
+        ['portal', 'GET', true],
+        ['settings', 'GET', true],
+        ['auth/password', 'POST', true],
+        ['users', 'GET', role === 'admin'],
+        ['settings', 'POST', role === 'admin'],
+        ['routing', 'POST', role === 'admin'],
+        ['operations/provider', 'GET', role === 'admin'],
+        ['campaigns', 'POST', role !== 'viewer'],
+        ['contacts/import', 'POST', role !== 'viewer'],
+        ['operations/crm/example', 'POST', role !== 'viewer'],
+        ['sms/test', 'POST', role !== 'viewer'],
+      ] as const;
+      for (const [path, method, permitted] of matrix) {
+        if (permitted)
+          expect(
+            await guard.canActivate(context(path, method, login.token)),
+          ).toBe(true);
+        else
+          await expect(
+            guard.canActivate(context(path, method, login.token)),
+          ).rejects.toThrow();
+      }
+    },
+  );
 });

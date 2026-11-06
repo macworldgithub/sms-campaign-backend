@@ -684,7 +684,7 @@ export class CampaignController {
     if (!message) return res.status(404).send('Link not found');
     const target = new URL(
       process.env.PUBLIC_PORTAL_URL
-        ? `${process.env.PUBLIC_PORTAL_URL.replace(/\/$/, '')}/loyalty`
+        ? `${process.env.PUBLIC_PORTAL_URL.replace(/\/$/, '')}/?view=customer`
         : process.env.LOYALTY_EMBED_URL ||
             'https://smh-loyalty-embed.netlify.app',
     );
